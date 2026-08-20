@@ -1,0 +1,23 @@
+[package]
+name = "agentwatch-hook"
+description = "The AgentWatch hook shim: reads one payload, forwards it, exits."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "agentwatch-hook"
+path = "src/main.rs"
+
+[dependencies]
+agentwatch-events.workspace = true
+agentwatch-types.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

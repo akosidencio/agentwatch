@@ -1,0 +1,53 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+repository = "https://github.com/akosidencio/agentwatch"
+
+[workspace.dependencies]
+agentwatch-types = { path = "crates/agentwatch-types" }
+agentwatch-events = { path = "crates/agentwatch-events" }
+agentwatch-storage = { path = "crates/agentwatch-storage" }
+agentwatch-adapter-claude = { path = "crates/agentwatch-adapter-claude" }
+
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["raw_value"] }
+sha2 = "0.10"
+thiserror = "2.0"
+time = { version = "0.3", features = ["formatting", "local-offset", "macros", "parsing", "serde"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["serde", "v4", "v5", "v7"] }
+
+tempfile = "3"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+
+[profile.dev.package."*"]
+opt-level = 2

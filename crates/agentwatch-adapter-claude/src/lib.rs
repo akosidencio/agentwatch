@@ -1,0 +1,31 @@
+//! Claude Code integration.
+//!
+//! Turns hook payloads into normalized events, and drops everything that would
+//! make AgentWatch a copy of the conversation.
+//!
+//! # What this adapter never keeps
+//!
+//! - Prompt text. Only a character count and a hash.
+//! - Tool results. `tool_response` is not even deserialized, so file contents
+//!   and command output never reach a Rust value, let alone the database.
+//! - File contents from `Write` and `Edit` payloads.
+//! - Conversation text from transcripts. `message.content` is not deserialized.
+//!
+//! Command lines *are* kept, because a command monitor that hides commands is
+//! pointless. That is a deliberate exception, and it means a command containing
+//! a secret is stored. Phase 4 adds scrubbing for the obvious shapes.
+
+#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
+
+mod hooks;
+mod redact;
+mod transcript;
+
+pub use hooks::ClaudeAdapter;
+pub use transcript::{
+    TranscriptError, TranscriptSummary, derived_transcript_path, find_transcripts,
+    read_token_usage, read_token_usage_from, transcript_root,
+};
+
+/// The `source` value the Claude hook binary puts in its envelopes.
+pub const SOURCE: &str = "claude-code";

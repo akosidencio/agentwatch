@@ -1,0 +1,29 @@
+[package]
+name = "agentwatch-daemon"
+description = "The AgentWatch background daemon."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "agentwatch-daemon"
+path = "src/main.rs"
+
+[dependencies]
+agentwatch-adapter-claude.workspace = true
+agentwatch-events.workspace = true
+agentwatch-storage.workspace = true
+agentwatch-types.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
