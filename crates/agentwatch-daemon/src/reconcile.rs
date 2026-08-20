@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use agentwatch_adapter_claude::{derived_transcript_path, read_token_usage, transcript_root};
 use agentwatch_storage::{PendingSession, Store, StoreError};
-use agentwatch_types::Timestamp;
+use agentwatch_types::{RepositoryResolver, Timestamp};
 
 /// Sessions examined per sweep.
 ///
@@ -120,6 +120,19 @@ pub fn sweep(store: &mut Store) -> Result<ReconcileReport, StoreError> {
         report.missing_transcripts += one.missing_transcripts;
         report.responses += one.responses;
         report.written += one.written;
+    }
+
+    // Resolution touches the filesystem, so it runs here rather than on the
+    // write path. Cheap to repeat: only newly seen directories are examined.
+    match store.backfill_repositories(&mut RepositoryResolver::new()) {
+        Ok(backfill) if backfill.projects > 0 => tracing::info!(
+            directories = backfill.projects,
+            repositories = backfill.repositories,
+            unresolved = backfill.unresolved,
+            "resolved directories to repositories"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::error!(?error, "repository backfill failed"),
     }
 
     if report.sessions > 0 {

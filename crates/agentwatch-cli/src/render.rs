@@ -1,7 +1,97 @@
 //! Turning rows into lines.
 
-use agentwatch_storage::{EventRow, TokenTotals};
+use agentwatch_storage::{EventRow, Notable, SessionRow, TokenTotals};
 use agentwatch_types::Timestamp;
+
+/// What the sensitive-access listing cannot tell you.
+///
+/// Printed with every security listing rather than buried in documentation: an
+/// empty list is the moment someone is most likely to read it as "nothing
+/// happened", and that is exactly what it does not mean.
+pub(crate) const SECURITY_CAVEAT: &str = concat!(
+    "Coverage note: paths are classified by name, never by reading them, so a\n",
+    "credential in an ordinarily-named file is invisible here. Command lines are\n",
+    "scanned, not parsed, so indirection hides references. Entries marked derived\n",
+    "are inferred from a command line, not observed."
+);
+
+/// Column header for a session listing.
+pub(crate) fn session_header() -> String {
+    format!(
+        "{:<8}  {:<16}  {:<9}  {:>13}  {:>4}  {:>4}  {:>4}  {:>4}  {}",
+        "session", "started", "duration", "tokens", "cmd", "file", "mcp", "sens", "project"
+    )
+}
+
+/// One row of a session listing.
+pub(crate) fn session_line(row: &SessionRow) -> String {
+    let started = row.started_at_us.map_or_else(|| "-".to_owned(), clock_time);
+    let duration = row.duration_ms.map_or_else(
+        || match row.status.as_str() {
+            "active" => "running".to_owned(),
+            // Never watched running, so neither a duration nor "running" is a
+            // claim this row can support.
+            "unknown" => "?".to_owned(),
+            _ => "-".to_owned(),
+        },
+        format_duration,
+    );
+
+    let home = std::env::var("HOME").ok();
+    let project = row
+        .project
+        .as_deref()
+        .map_or_else(|| "-".to_owned(), |path| short_path(path, home.as_deref()));
+
+    let sensitive = if row.sensitive > 0 {
+        row.sensitive.to_string()
+    } else {
+        "-".to_owned()
+    };
+
+    format!(
+        "{:<8}  {started:<16}  {duration:<9}  {:>13}  {:>4}  {:>4}  {:>4}  {sensitive:>4}  {project}",
+        &row.id[..8.min(row.id.len())],
+        thousands(row.tokens),
+        row.commands,
+        row.files,
+        row.mcp_calls,
+    )
+}
+
+/// Renders a duration in milliseconds as a short human string.
+fn format_duration(milliseconds: i64) -> String {
+    let seconds = milliseconds / 1_000;
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}m {}s", seconds % 60);
+    }
+    format!("{}h {}m", minutes / 60, minutes % 60)
+}
+
+/// Column header for a sensitive-access listing.
+pub(crate) fn notable_header() -> String {
+    format!(
+        "{:<17}  {:<8}  {:<9}  {:<8}  {}",
+        "severity", "utc", "kind", "evidence", "path"
+    )
+}
+
+/// One row of a sensitive-access listing.
+pub(crate) fn notable_line(row: &Notable) -> String {
+    let home = std::env::var("HOME").ok();
+    format!(
+        "{:<17}  {:<8}  {:<9}  {:<8}  {}",
+        row.sensitivity,
+        clock_time(row.timestamp_us),
+        row.kind,
+        row.evidence,
+        short_path(&row.path, home.as_deref())
+    )
+}
 
 /// Formats an integer with thousands separators.
 ///
@@ -127,7 +217,7 @@ fn string_field(value: &serde_json::Value, field: &str) -> String {
 ///
 /// Takes the home directory as an argument rather than reading it, so the
 /// behaviour is testable without mutating process-wide environment state.
-fn short_path(path: &str, home: Option<&str>) -> String {
+pub(crate) fn short_path(path: &str, home: Option<&str>) -> String {
     match home
         .filter(|home| !home.is_empty())
         .and_then(|home| path.strip_prefix(home))
@@ -150,6 +240,89 @@ mod tests {
             project_path: Some("/work/acme".to_owned()),
             payload: payload.to_owned(),
         }
+    }
+
+    #[test]
+    fn a_duration_reads_in_the_largest_useful_unit() {
+        assert_eq!(format_duration(45_000), "45s");
+        assert_eq!(format_duration(125_000), "2m 5s");
+        assert_eq!(format_duration(7_500_000), "2h 5m");
+    }
+
+    #[test]
+    fn a_running_session_says_so_rather_than_showing_a_dash() {
+        let row = SessionRow {
+            id: "abcdef1234".to_owned(),
+            agent_id: "claude-code".to_owned(),
+            project: Some("/work/acme".to_owned()),
+            git_branch: None,
+            started_at_us: Some(1_755_000_000_000_000),
+            duration_ms: None,
+            status: "active".to_owned(),
+            tokens: 1_000,
+            responses: 2,
+            commands: 3,
+            files: 4,
+            mcp_calls: 0,
+            sensitive: 0,
+        };
+        let line = session_line(&row);
+        assert!(line.contains("running"), "{line}");
+        assert!(line.contains("abcdef12"), "{line}");
+    }
+
+    #[test]
+    fn a_session_that_was_never_watched_says_so() {
+        let row = SessionRow {
+            id: "abcdef1234".to_owned(),
+            agent_id: "claude-code".to_owned(),
+            project: None,
+            git_branch: None,
+            started_at_us: Some(1_755_000_000_000_000),
+            duration_ms: None,
+            status: "unknown".to_owned(),
+            tokens: 5,
+            responses: 1,
+            commands: 0,
+            files: 0,
+            mcp_calls: 0,
+            sensitive: 0,
+        };
+        let line = session_line(&row);
+        assert!(line.contains('?'), "{line}");
+        assert!(
+            !line.contains("running"),
+            "an imported session is not running"
+        );
+    }
+
+    #[test]
+    fn a_session_with_no_sensitive_access_shows_a_dash_not_a_zero() {
+        let row = SessionRow {
+            id: "abcdef1234".to_owned(),
+            agent_id: "claude-code".to_owned(),
+            project: None,
+            git_branch: None,
+            started_at_us: None,
+            duration_ms: Some(1_000),
+            status: "ended".to_owned(),
+            tokens: 0,
+            responses: 0,
+            commands: 0,
+            files: 0,
+            mcp_calls: 0,
+            sensitive: 0,
+        };
+        assert!(
+            session_line(&row).contains(" -"),
+            "a zero count should read as absent"
+        );
+    }
+
+    #[test]
+    fn the_security_caveat_names_both_of_its_blind_spots() {
+        assert!(SECURITY_CAVEAT.contains("classified by name"));
+        assert!(SECURITY_CAVEAT.contains("scanned, not parsed"));
     }
 
     #[test]

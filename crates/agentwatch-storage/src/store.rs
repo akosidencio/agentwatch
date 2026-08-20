@@ -1,6 +1,6 @@
 //! The write side.
 
-use agentwatch_events::{AgentEvent, Event, FileEvent};
+use agentwatch_events::{AgentEvent, Event, FileEvent, classify, scan_command, worst_in_command};
 use agentwatch_types::Timestamp;
 use rusqlite::{Connection, OpenFlags, Transaction, params};
 use std::path::Path;
@@ -14,6 +14,17 @@ pub enum StoreError {
     /// The database rejected a statement.
     #[error("database error")]
     Sqlite(#[from] rusqlite::Error),
+    /// The database was written by an older build than this one.
+    #[error(
+        "database is at schema version {found}, this build expects {expected}\n\
+         Run `agentwatch import` or start `agentwatch-daemon` to migrate it."
+    )]
+    SchemaTooOld {
+        /// Version the database is at.
+        found: i64,
+        /// Version this build needs.
+        expected: i64,
+    },
     /// An event could not be encoded for storage.
     #[error("could not encode event payload")]
     Encode(#[from] serde_json::Error),
@@ -22,7 +33,7 @@ pub enum StoreError {
 /// A connection to the event database.
 #[derive(Debug)]
 pub struct Store {
-    connection: Connection,
+    pub(crate) connection: Connection,
 }
 
 impl Store {
@@ -66,6 +77,16 @@ impl Store {
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI;
         let connection = Connection::open_with_flags(path, flags)?;
         connection.pragma_update(None, "busy_timeout", 5_000)?;
+
+        // Checked before `query_only` is set, and before any query runs: a
+        // reader that skips this hits a missing table and reports it as a
+        // database error, which tells the user nothing about what to do.
+        let found = migrations::current_version(&connection)?;
+        let expected = migrations::expected_version();
+        if found < expected {
+            return Err(StoreError::SchemaTooOld { found, expected });
+        }
+
         connection.pragma_update(None, "query_only", "ON")?;
         Ok(Self { connection })
     }
@@ -241,10 +262,41 @@ fn write_projection(
         Event::Command(command) => {
             transaction.execute(
                 "INSERT OR IGNORE INTO command_events
-                    (id, timestamp_us, agent_id, session_id, project_id, command, description, created_at_us)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![id, timestamp, agent, session, project, command.command, command.description, now],
+                    (id, timestamp_us, agent_id, session_id, project_id, command, description, sensitivity, created_at_us)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    id,
+                    timestamp,
+                    agent,
+                    session,
+                    project,
+                    command.command,
+                    command.description,
+                    worst_in_command(&command.command).as_str(),
+                    now,
+                ],
             )?;
+
+            // A shell command is opaque to tool-level reporting, so anything it
+            // referred to is recorded separately as inference.
+            for (index, reference) in scan_command(&command.command).into_iter().enumerate() {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO command_path_references
+                        (id, command_id, timestamp_us, agent_id, session_id, project_id, path, sensitivity, created_at_us)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        format!("{id}:{index}"),
+                        id,
+                        timestamp,
+                        agent,
+                        session,
+                        project,
+                        reference.path,
+                        reference.sensitivity.as_str(),
+                        now,
+                    ],
+                )?;
+            }
         }
         Event::McpCall(mcp) => {
             transaction.execute(
@@ -279,9 +331,20 @@ fn write_file(
 ) -> Result<(), StoreError> {
     transaction.execute(
         "INSERT OR IGNORE INTO file_events
-            (id, timestamp_us, agent_id, session_id, project_id, operation, path, tool, created_at_us)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![id, timestamp, agent, session, project, operation, file.path, file.tool, now],
+            (id, timestamp_us, agent_id, session_id, project_id, operation, path, tool, sensitivity, created_at_us)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            id,
+            timestamp,
+            agent,
+            session,
+            project,
+            operation,
+            file.path,
+            file.tool,
+            classify(&file.path).as_str(),
+            now,
+        ],
     )?;
     Ok(())
 }
@@ -303,15 +366,28 @@ fn upsert_session(
         _ => None,
     };
 
+    // A session is only `active` if its start was actually observed. Sessions
+    // discovered by reading a transcript were never watched running, and
+    // reporting them as running would be a claim we cannot support.
+    let status = if matches!(event.event, Event::SessionStarted(_)) {
+        "active"
+    } else {
+        "unknown"
+    };
+
     transaction.execute(
         "INSERT INTO sessions
             (id, agent_id, external_session_id, project_id, started_at_us, status, transcript_path, created_at_us, git_branch)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7, ?8)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?9, ?6, ?7, ?8)
          ON CONFLICT(id) DO UPDATE SET
             started_at_us   = MIN(COALESCE(started_at_us, excluded.started_at_us), excluded.started_at_us),
             project_id      = COALESCE(sessions.project_id, excluded.project_id),
             transcript_path = COALESCE(excluded.transcript_path, sessions.transcript_path),
-            git_branch      = COALESCE(excluded.git_branch, sessions.git_branch)",
+            git_branch      = COALESCE(excluded.git_branch, sessions.git_branch),
+            status          = CASE
+                                WHEN sessions.status = 'unknown' THEN excluded.status
+                                ELSE sessions.status
+                              END",
         params![
             session_id,
             event.agent_id.as_str(),
@@ -321,6 +397,7 @@ fn upsert_session(
             transcript_path,
             now,
             event.git_branch.as_deref(),
+            status,
         ],
     )?;
 
@@ -361,6 +438,30 @@ mod tests {
         )
         .with_session(ExternalSessionId::from(session.to_owned()))
         .with_project_path("/Users/dev/projects/acme".to_owned())
+    }
+
+    #[test]
+    fn a_reader_refuses_a_database_from_an_older_build() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let database = directory.path().join("events.db");
+        {
+            let writer = Connection::open(&database).expect("open");
+            writer
+                .execute_batch(
+                    "CREATE TABLE schema_migrations (
+                        version INTEGER PRIMARY KEY, name TEXT NOT NULL,
+                        applied_at TEXT NOT NULL DEFAULT (datetime('now'))) STRICT;
+                     INSERT INTO schema_migrations (version, name) VALUES (1, 'old');",
+                )
+                .expect("seed an old schema");
+        }
+
+        let error = Store::open_read_only(&database).expect_err("should refuse");
+        let message = format!("{error}");
+        assert!(
+            message.contains("agentwatch import"),
+            "unhelpful message: {message}"
+        );
     }
 
     #[test]
@@ -514,6 +615,78 @@ mod tests {
     }
 
     #[test]
+    fn a_sensitive_file_read_is_classified_at_ingest() {
+        use agentwatch_events::FileEvent as Fe;
+
+        let mut store = Store::open_in_memory().expect("schema");
+        store
+            .insert_events(&[AgentEvent::observed(
+                AgentId::CLAUDE_CODE,
+                EvidenceSource::Hook,
+                Event::FileRead(Fe {
+                    path: "/Users/dev/.aws/credentials".into(),
+                    tool: "Read".into(),
+                }),
+            )])
+            .expect("insert");
+
+        let sensitivity: String = store
+            .connection()
+            .query_row("SELECT sensitivity FROM file_events", [], |row| row.get(0))
+            .expect("query");
+        assert_eq!(sensitivity, "highly_sensitive");
+    }
+
+    #[test]
+    fn a_command_reading_dotenv_records_the_reference_it_implies() {
+        let mut store = Store::open_in_memory().expect("schema");
+        store
+            .insert_events(&[AgentEvent::observed(
+                AgentId::CLAUDE_CODE,
+                EvidenceSource::Hook,
+                Event::Command(CommandEvent {
+                    command: "cat .env | grep KEY".into(),
+                    description: None,
+                }),
+            )])
+            .expect("insert");
+
+        let (path, sensitivity): (String, String) = store
+            .connection()
+            .query_row(
+                "SELECT path, sensitivity FROM command_path_references",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query");
+        assert_eq!((path.as_str(), sensitivity.as_str()), (".env", "sensitive"));
+
+        let command_sensitivity: String = store
+            .connection()
+            .query_row("SELECT sensitivity FROM command_events", [], |row| {
+                row.get(0)
+            })
+            .expect("query");
+        assert_eq!(command_sensitivity, "sensitive");
+    }
+
+    #[test]
+    fn an_ordinary_command_records_no_path_references() {
+        let mut store = Store::open_in_memory().expect("schema");
+        store
+            .insert_events(&[command_event("s-1")])
+            .expect("insert");
+
+        let references: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM command_path_references", [], |row| {
+                row.get(0)
+            })
+            .expect("query");
+        assert_eq!(references, 0);
+    }
+
+    #[test]
     fn a_command_and_an_mcp_call_land_in_their_typed_tables() {
         use agentwatch_events::McpEvent;
 
@@ -604,6 +777,66 @@ mod tests {
             .expect("count");
 
         assert_eq!((agents, projects, sessions), (1, 1, 1));
+    }
+
+    #[test]
+    fn a_session_discovered_from_a_transcript_is_not_reported_as_running() {
+        let mut store = Store::open_in_memory().expect("schema");
+        store
+            .insert_events(&[token_event("msg_1", 10)])
+            .expect("insert");
+
+        let status: String = store
+            .connection()
+            .query_row("SELECT status FROM sessions", [], |row| row.get(0))
+            .expect("query");
+        assert_eq!(status, "unknown");
+    }
+
+    #[test]
+    fn an_observed_start_makes_a_session_active() {
+        let mut store = Store::open_in_memory().expect("schema");
+        let external = ExternalSessionId::from("s-1".to_owned());
+        store
+            .insert_events(&[
+                command_event("s-1"),
+                AgentEvent::observed(
+                    AgentId::CLAUDE_CODE,
+                    EvidenceSource::Hook,
+                    Event::SessionStarted(SessionStarted::default()),
+                )
+                .with_session(external),
+            ])
+            .expect("insert");
+
+        let status: String = store
+            .connection()
+            .query_row("SELECT status FROM sessions", [], |row| row.get(0))
+            .expect("query");
+        assert_eq!(status, "active", "an observed start should upgrade unknown");
+    }
+
+    #[test]
+    fn a_later_event_does_not_reopen_an_ended_session() {
+        let mut store = Store::open_in_memory().expect("schema");
+        let external = ExternalSessionId::from("s-1".to_owned());
+        store
+            .insert_events(&[
+                AgentEvent::observed(
+                    AgentId::CLAUDE_CODE,
+                    EvidenceSource::Hook,
+                    Event::SessionEnded(SessionEnded::default()),
+                )
+                .with_session(external),
+                command_event("s-1"),
+            ])
+            .expect("insert");
+
+        let status: String = store
+            .connection()
+            .query_row("SELECT status FROM sessions", [], |row| row.get(0))
+            .expect("query");
+        assert_eq!(status, "ended");
     }
 
     #[test]

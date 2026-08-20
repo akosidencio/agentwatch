@@ -8,9 +8,15 @@
 
 mod migrations;
 mod query;
+mod repositories;
+mod security;
+mod sessions;
 mod store;
 mod tokens;
 
 pub use query::{EventRow, Totals};
+pub use repositories::BackfillReport;
+pub use security::Notable;
+pub use sessions::{ActivityFilter, Coverage, SessionRow};
 pub use store::{Store, StoreError};
 pub use tokens::{PendingSession, TokenGroup, TokenTotals};

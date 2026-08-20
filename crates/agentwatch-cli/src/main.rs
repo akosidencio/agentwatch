@@ -9,8 +9,9 @@ mod hook_config;
 mod range;
 mod render;
 mod sync;
+mod watch;
 
-use agentwatch_storage::{Store, TokenTotals};
+use agentwatch_storage::{ActivityFilter, Coverage, Store, TokenTotals};
 use agentwatch_types::Paths;
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
@@ -31,8 +32,10 @@ struct Cli {
 /// How to group a token breakdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum Grouping {
-    /// By working directory.
+    /// By repository, rolling up every directory inside it.
     Project,
+    /// By the exact working directory the session started in.
+    Directory,
     /// By the exact model identifier the provider reported.
     Model,
     /// By calendar day in your local timezone.
@@ -71,6 +74,62 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Watch activity live in a full-screen view.
+    Watch,
+    /// List sessions.
+    Sessions {
+        /// Number of calendar days to include, ending today.
+        #[arg(long, default_value_t = 7)]
+        days: u32,
+        /// Show at most this many sessions.
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+        /// Show what each session's data can and cannot answer.
+        #[arg(long)]
+        coverage: bool,
+    },
+    /// Show a timeline of what agents did.
+    Activity {
+        /// Number of calendar days to include, ending today.
+        #[arg(long, default_value_t = 1)]
+        days: u32,
+        /// Show at most this many events.
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        /// Restrict to one agent.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Restrict to one session id.
+        #[arg(long)]
+        session: Option<String>,
+        /// Restrict to repositories or directories under this path.
+        #[arg(long)]
+        project: Option<String>,
+        /// Restrict to event kinds, for example `command` or `file.read`.
+        #[arg(long, value_delimiter = ',')]
+        kind: Vec<String>,
+    },
+    /// List access to sensitive paths.
+    Security {
+        /// Number of calendar days to include, ending today.
+        #[arg(long, default_value_t = 7)]
+        days: u32,
+        /// Show at most this many entries.
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
+    /// Write events to stdout as JSON Lines.
+    Export {
+        /// Number of calendar days to include, ending today.
+        #[arg(long, default_value_t = 7)]
+        days: u32,
+        /// Export at most this many events.
+        #[arg(long, default_value_t = 100_000)]
+        limit: u32,
+        /// Restrict to event kinds.
+        #[arg(long, value_delimiter = ',')]
+        kind: Vec<String>,
+    },
     /// Read historical token usage out of Claude Code's own transcripts.
     ///
     /// Safe to run repeatedly: nothing is double counted.
@@ -107,6 +166,32 @@ fn main() -> Result<()> {
             all,
             limit,
         } => tokens(&paths, by, days, from.as_deref(), to.as_deref(), all, limit),
+        Command::Watch => watch::run(&paths),
+        Command::Sessions {
+            days,
+            limit,
+            coverage,
+        } => sessions(&paths, days, limit, coverage),
+        Command::Activity {
+            days,
+            limit,
+            agent,
+            session,
+            project,
+            kind,
+        } => activity(
+            &paths,
+            days,
+            limit,
+            ActivityFilter {
+                agent,
+                session,
+                project_prefix: project,
+                kinds: kind,
+            },
+        ),
+        Command::Security { days, limit } => security(&paths, days, limit),
+        Command::Export { days, limit, kind } => export(&paths, days, limit, kind),
         Command::Import { limit } => import(&paths, limit),
         Command::Verify => verify(&paths),
         Command::HookConfig { binary } => {
@@ -177,7 +262,8 @@ fn tokens(
     print_totals(&totals);
 
     let groups = match by {
-        Grouping::Project => store.tokens_by_project(range.from_us, range.to_us),
+        Grouping::Project => store.tokens_by_repository(range.from_us, range.to_us),
+        Grouping::Directory => store.tokens_by_project(range.from_us, range.to_us),
         Grouping::Model => store.tokens_by_model(range.from_us, range.to_us),
         Grouping::Day => store.tokens_by_day(range.from_us, range.to_us, range.offset_seconds()),
     }
@@ -219,7 +305,8 @@ fn tokens(
 /// The column heading for a grouping.
 const fn by_label(by: Grouping) -> &'static str {
     match by {
-        Grouping::Project => "project",
+        Grouping::Project => "repository",
+        Grouping::Directory => "directory",
         Grouping::Model => "model",
         Grouping::Day => "day",
     }
@@ -245,12 +332,165 @@ fn print_totals(totals: &TokenTotals) {
     );
 }
 
+/// Lists sessions with their counts.
+fn sessions(paths: &Paths, days: u32, limit: u32, show_coverage: bool) -> Result<()> {
+    let store = open_for_reading(paths)?;
+    let (offset, _) = range::local_offset();
+    let range = range::last_days(days, offset);
+
+    let rows = store
+        .sessions(range.from_us, range.to_us, limit)
+        .context("reading sessions")?;
+
+    println!("Sessions — {}", range.label);
+    if rows.is_empty() {
+        println!("\nNone.");
+        return Ok(());
+    }
+
+    println!();
+    println!("{}", render::session_header());
+    for row in &rows {
+        println!("{}", render::session_line(row));
+    }
+
+    if !show_coverage {
+        return Ok(());
+    }
+
+    for row in &rows {
+        let coverage = store.coverage(&row.id).context("reading coverage")?;
+        println!();
+        println!(
+            "{}  {}",
+            &row.id[..8],
+            row.project.as_deref().unwrap_or("(no project)")
+        );
+        print_coverage(&coverage);
+    }
+
+    Ok(())
+}
+
+/// Prints what a session's data can answer.
+///
+/// `disabled` and `not collected` are distinct from `no`: one means the data
+/// was never gathered, the other that it was gathered and there was none.
+fn print_coverage(coverage: &Coverage) {
+    let observed = |seen: bool| if seen { "yes" } else { "none seen" };
+
+    println!("  tokens         {}", observed(coverage.tokens));
+    println!("  session start  {}", observed(coverage.session_bounds));
+    println!("  tools          {}", observed(coverage.tools));
+    println!("  commands       {}", observed(coverage.commands));
+    println!("  files          {}", observed(coverage.files));
+    println!("  mcp            {}", observed(coverage.mcp));
+    println!("  network        not collected");
+    println!("  processes      not collected");
+    println!("  prompt content disabled");
+}
+
+/// Prints a timeline of events.
+fn activity(paths: &Paths, days: u32, limit: u32, filter: ActivityFilter) -> Result<()> {
+    let store = open_for_reading(paths)?;
+    let (offset, _) = range::local_offset();
+    let range = range::last_days(days, offset);
+
+    let rows = store
+        .activity(range.from_us, range.to_us, &filter, limit)
+        .context("reading activity")?;
+
+    println!("Activity — {}", range.label);
+    if rows.is_empty() {
+        println!("\nNothing recorded.");
+        return Ok(());
+    }
+
+    println!();
+    println!("{}", render::header());
+    for row in &rows {
+        println!("{}", render::event_line(row));
+    }
+    Ok(())
+}
+
+/// Lists access to sensitive paths.
+fn security(paths: &Paths, days: u32, limit: u32) -> Result<()> {
+    let store = open_for_reading(paths)?;
+    let (offset, _) = range::local_offset();
+    let range = range::last_days(days, offset);
+
+    let rows = store
+        .notable_access(range.from_us, range.to_us, limit)
+        .context("reading sensitive access")?;
+
+    println!("Sensitive access — {}", range.label);
+
+    if rows.is_empty() {
+        println!("\nNothing above normal.");
+        println!();
+        println!("{}", render::SECURITY_CAVEAT);
+        return Ok(());
+    }
+
+    println!();
+    println!("{}", render::notable_header());
+    for row in &rows {
+        println!("{}", render::notable_line(row));
+    }
+    println!();
+    println!("{}", render::SECURITY_CAVEAT);
+    Ok(())
+}
+
+/// Writes events to stdout as JSON Lines.
+fn export(paths: &Paths, days: u32, limit: u32, kinds: Vec<String>) -> Result<()> {
+    use std::io::Write as _;
+
+    let store = open_for_reading(paths)?;
+    let (offset, _) = range::local_offset();
+    let range = range::last_days(days, offset);
+
+    let filter = ActivityFilter {
+        kinds,
+        ..ActivityFilter::default()
+    };
+    let rows = store
+        .activity(range.from_us, range.to_us, &filter, limit)
+        .context("reading events")?;
+
+    // Locked and buffered: an export is the one command likely to be piped into
+    // something, and per-line locking would dominate its runtime.
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+
+    for row in &rows {
+        let payload: serde_json::Value = serde_json::from_str(&row.payload)
+            .unwrap_or_else(|_| serde_json::Value::String(row.payload.clone()));
+        let record = serde_json::json!({
+            "timestamp": agentwatch_types::Timestamp::from_micros(row.timestamp_us).to_rfc3339(),
+            "agent": row.agent_id,
+            "kind": row.kind,
+            "evidence": row.evidence,
+            "project": row.project_path,
+            "event": payload,
+        });
+        writeln!(out, "{record}").context("writing to stdout")?;
+    }
+
+    out.flush().context("flushing stdout")?;
+    Ok(())
+}
+
 /// Imports historical usage from transcripts.
 fn import(paths: &Paths, limit: Option<usize>) -> Result<()> {
     paths.ensure_root().context("creating the data directory")?;
     let mut store = Store::open(paths.database()).context("opening the database")?;
 
     let report = sync::import(&mut store, limit)?;
+    let repositories = store
+        .backfill_repositories(&mut agentwatch_types::RepositoryResolver::new())
+        .context("resolving repositories")?;
 
     println!("transcripts read     {}", report.files);
     if report.unreadable > 0 {
@@ -267,6 +507,10 @@ fn import(paths: &Paths, limit: Option<usize>) -> Result<()> {
     println!(
         "rows written         {}",
         render::thousands(report.written as i64)
+    );
+    println!(
+        "repositories         {} (from {} directories, {} outside any repository)",
+        repositories.repositories, repositories.projects, repositories.unresolved
     );
     println!();
     println!(
@@ -312,7 +556,7 @@ fn verify(paths: &Paths) -> Result<()> {
 }
 
 /// Opens the database for reading, with a useful message when it is absent.
-fn open_for_reading(paths: &Paths) -> Result<Store> {
+pub(crate) fn open_for_reading(paths: &Paths) -> Result<Store> {
     anyhow::ensure!(
         paths.database().exists(),
         "no database yet at {}\nStart the daemon with `agentwatch-daemon`, or run `agentwatch import`.",

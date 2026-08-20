@@ -83,6 +83,39 @@ impl Store {
         Ok(totals)
     }
 
+    /// Breaks token usage down by repository, largest first.
+    ///
+    /// Rows that never resolved to a repository fall back to their working
+    /// directory rather than collapsing into one "(unknown)" bucket, so work
+    /// done outside a repository stays visible and attributed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be queried.
+    pub fn tokens_by_repository(
+        &self,
+        from_us: i64,
+        to_us: i64,
+    ) -> Result<Vec<TokenGroup>, StoreError> {
+        self.token_groups(
+            "SELECT COALESCE(r.root, p.path, '(unknown)'),
+                    COALESCE(SUM(t.input_tokens), 0),
+                    COALESCE(SUM(t.cache_creation_input_tokens), 0),
+                    COALESCE(SUM(t.cache_read_input_tokens), 0),
+                    COALESCE(SUM(t.output_tokens), 0),
+                    COUNT(*)
+               FROM token_usage t
+               LEFT JOIN repositories r ON r.id = t.repository_id
+               LEFT JOIN projects p     ON p.id = t.project_id
+              WHERE t.timestamp_us >= ?1 AND t.timestamp_us < ?2
+              GROUP BY COALESCE(t.repository_id, t.project_id)
+              ORDER BY SUM(t.input_tokens) + SUM(t.cache_creation_input_tokens)
+                     + SUM(t.cache_read_input_tokens) + SUM(t.output_tokens) DESC",
+            from_us,
+            to_us,
+        )
+    }
+
     /// Breaks token usage down by project, largest first.
     ///
     /// # Errors
@@ -342,6 +375,49 @@ mod tests {
             groups[0].label, "/work/busy",
             "ordering must use the summed total"
         );
+    }
+
+    #[test]
+    fn repository_breakdown_merges_directories_under_one_root() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let root = directory.path().join("acme");
+        let nested = root.join("packages").join("core");
+        std::fs::create_dir_all(&nested).expect("create");
+        std::fs::create_dir_all(root.join(".git")).expect("marker");
+
+        let mut store = Store::open_in_memory().expect("schema");
+        store
+            .insert_events(&[
+                usage("m1", 1_000_000, 10, &root.to_string_lossy()),
+                usage("m2", 2_000_000, 20, &nested.to_string_lossy()),
+            ])
+            .expect("insert");
+        store
+            .backfill_repositories(&mut agentwatch_types::RepositoryResolver::new())
+            .expect("backfill");
+
+        let by_directory = store.tokens_by_project(0, i64::MAX).expect("directories");
+        let by_repository = store
+            .tokens_by_repository(0, i64::MAX)
+            .expect("repositories");
+
+        assert_eq!(by_directory.len(), 2, "two directories");
+        assert_eq!(by_repository.len(), 1, "one repository");
+        assert_eq!(by_repository[0].totals.output, 30);
+    }
+
+    #[test]
+    fn work_outside_a_repository_falls_back_to_its_directory() {
+        let mut store = Store::open_in_memory().expect("schema");
+        store
+            .insert_events(&[usage("m1", 1_000, 5, "/loose/place")])
+            .expect("insert");
+        store
+            .backfill_repositories(&mut agentwatch_types::RepositoryResolver::new())
+            .expect("backfill");
+
+        let groups = store.tokens_by_repository(0, i64::MAX).expect("groups");
+        assert_eq!(groups[0].label, "/loose/place");
     }
 
     #[test]

@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use agentwatch_events::AgentEvent;
 use agentwatch_storage::Store;
+use agentwatch_types::RepositoryResolver;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::time::Instant;
 
@@ -97,11 +98,21 @@ async fn flush(
 fn spawn_writer(mut store: Store) -> (Sender<Vec<AgentEvent>>, tokio::task::JoinHandle<()>) {
     let (sender, mut receiver) = channel::<Vec<AgentEvent>>(WRITE_QUEUE_DEPTH);
 
+    // Lives with the writer thread so its cache survives between batches.
+    let mut resolver = RepositoryResolver::new();
+
     let handle = tokio::task::spawn_blocking(move || {
         while let Some(batch) = receiver.blocking_recv() {
             match store.insert_events(&batch) {
                 Ok(written) => {
                     tracing::debug!(written, queued = batch.len(), "wrote batch");
+
+                    // Almost always a no-op: it returns before opening a
+                    // transaction unless a directory has been seen for the
+                    // first time.
+                    if let Err(error) = store.backfill_repositories(&mut resolver) {
+                        tracing::error!(?error, "repository backfill failed");
+                    }
                 }
                 Err(error) => {
                     // A failed batch is dropped rather than retried: retrying a

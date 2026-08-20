@@ -18,6 +18,8 @@ agentwatch-storage.workspace = true
 agentwatch-types.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
 serde_json.workspace = true
 time.workspace = true
 

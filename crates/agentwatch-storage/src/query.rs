@@ -135,8 +135,28 @@ mod tests {
         let totals = store.totals().expect("totals");
         assert_eq!(totals.events, 2);
         assert_eq!(totals.sessions, 1);
-        assert_eq!(totals.active_sessions, 1);
         assert_eq!(totals.projects, 1);
+        assert_eq!(
+            totals.active_sessions, 0,
+            "these events never reported a session starting, so nothing is known to be running"
+        );
+    }
+
+    #[test]
+    fn a_session_counts_as_active_only_once_its_start_is_observed() {
+        use agentwatch_events::SessionStarted;
+
+        let mut store = Store::open_in_memory().expect("schema");
+        store
+            .insert_events(&[AgentEvent::observed(
+                AgentId::CLAUDE_CODE,
+                EvidenceSource::Hook,
+                Event::SessionStarted(SessionStarted::default()),
+            )
+            .with_session(ExternalSessionId::from("s-1".to_owned()))])
+            .expect("insert");
+
+        assert_eq!(store.totals().expect("totals").active_sessions, 1);
     }
 
     #[test]

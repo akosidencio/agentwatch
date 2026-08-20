@@ -5,7 +5,7 @@ See what your AI agents are doing on your machine.
 Local-first activity monitoring for AI coding agents. Everything stays on your
 machine: no network calls, no accounts, no telemetry leaving the box.
 
-**Status:** phase 2 of 4. Claude Code on macOS only. See [PLAN.md](PLAN.md).
+**Status:** phase 3 of 4. Claude Code on macOS only. See [PLAN.md](PLAN.md).
 
 ## What it does today
 
@@ -29,10 +29,21 @@ repeatedly — nothing is double counted.
 ```sh
 agentwatch tokens --today
 agentwatch tokens --days 7 --by day
-agentwatch tokens --all --by project --limit 10
+agentwatch tokens --all --by project --limit 10     # rolled up to repositories
+agentwatch tokens --all --by directory              # exact working directories
 agentwatch tokens --from 2026-08-01 --to 2026-08-21 --by model
-agentwatch verify          # re-derive totals from source and report drift
+
+agentwatch sessions --days 7 --coverage             # counts, plus what was observed
+agentwatch activity --days 1 --kind command,file.write
+agentwatch security --days 7                        # access to sensitive paths
+agentwatch export --days 7 --kind command > commands.jsonl
+
+agentwatch watch                                    # live full-screen view
+agentwatch verify                                   # re-derive totals, report drift
 ```
+
+`watch` is a separate surface on purpose. It owns the terminal, so it cannot be
+piped; every other command prints plain stdout so it can be.
 
 ## What it never records
 
@@ -98,8 +109,28 @@ startup — no Tokio, no SQLite. It opens the socket, writes one frame, and exit
   not a `Read`, so it produces no file event.
 - The hook is configured through a file the monitored agent can edit. Fine for
   analytics, disqualifying for anything claiming to be a security control.
-- Projects are keyed by working directory, so a session started in a
-  subdirectory counts as a separate project from one started at the repo root.
-  Phase 3 rolls these up to the repository.
+- Sensitive paths are classified **by name, never by reading them**. A
+  credential in an ordinarily-named file is invisible. Reading files to find
+  out would mean AgentWatch handling every secret on the machine, which is a
+  worse position than the one it reports on.
+- Command lines are **scanned, not parsed**. `cat .env` is caught; `eval`,
+  variable expansion, and heredocs are not. Anything recovered this way is
+  labelled `derived` and never mixed in with tool-reported file events.
 - Cost is not estimated. On a subscription the per-token price is a number
   nobody pays, so tokens are the headline and cost stays opt-in.
+
+## License
+
+Dual licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+
+at your option.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this work by you, as defined in the Apache-2.0 license, shall
+be dual licensed as above, without any additional terms or conditions.

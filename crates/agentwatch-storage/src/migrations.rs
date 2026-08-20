@@ -155,7 +155,100 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         CREATE INDEX mcp_events_project_timestamp ON mcp_events (project_id, timestamp_us);
     ",
     },
+    Migration {
+        version: 3,
+        name: "repositories",
+        sql: r"
+        -- Repositories sit alongside projects rather than replacing them. A
+        -- project is the directory the session was started in, which is the
+        -- honest answer to 'where'; a repository is what it was working on.
+        -- Keeping both means this migration invalidates nothing already stored,
+        -- and existing rows can be repaired by backfill rather than re-import.
+        CREATE TABLE repositories (
+            id            TEXT PRIMARY KEY,
+            root          TEXT NOT NULL UNIQUE,
+            name          TEXT NOT NULL,
+            first_seen_us INTEGER NOT NULL,
+            last_seen_us  INTEGER NOT NULL
+        ) STRICT;
+
+        ALTER TABLE projects    ADD COLUMN repository_id TEXT;
+        ALTER TABLE sessions    ADD COLUMN repository_id TEXT;
+        ALTER TABLE events      ADD COLUMN repository_id TEXT;
+        ALTER TABLE token_usage ADD COLUMN repository_id TEXT;
+
+        CREATE INDEX projects_repository    ON projects (repository_id);
+        CREATE INDEX events_repository      ON events (repository_id, timestamp_us);
+        CREATE INDEX token_usage_repository ON token_usage (repository_id, timestamp_us);
+    ",
+    },
+    Migration {
+        version: 4,
+        name: "sensitivity",
+        sql: r"
+        -- Classification is computed once at ingest rather than at query time:
+        -- the rules are cheap but the answer is what alerts key off, and a rule
+        -- change should not silently rewrite what was reported yesterday.
+        ALTER TABLE file_events    ADD COLUMN sensitivity TEXT NOT NULL DEFAULT 'normal';
+        ALTER TABLE command_events ADD COLUMN sensitivity TEXT NOT NULL DEFAULT 'normal';
+
+        -- Paths a command line referred to. Inference, not observation: kept in
+        -- its own table so it can never be mistaken for a file the agent's own
+        -- tools reported touching.
+        CREATE TABLE command_path_references (
+            id            TEXT PRIMARY KEY,
+            command_id    TEXT NOT NULL,
+            timestamp_us  INTEGER NOT NULL,
+            agent_id      TEXT NOT NULL,
+            session_id    TEXT,
+            project_id    TEXT,
+            path          TEXT NOT NULL,
+            sensitivity   TEXT NOT NULL,
+            created_at_us INTEGER NOT NULL
+        ) STRICT;
+
+        CREATE INDEX command_refs_command     ON command_path_references (command_id);
+        CREATE INDEX command_refs_timestamp   ON command_path_references (timestamp_us);
+        CREATE INDEX command_refs_sensitivity ON command_path_references (sensitivity, timestamp_us);
+
+        CREATE INDEX file_events_sensitivity    ON file_events (sensitivity, timestamp_us);
+        CREATE INDEX command_events_sensitivity ON command_events (sensitivity, timestamp_us);
+    ",
+    },
+    Migration {
+        version: 5,
+        name: "honest_session_status",
+        sql: r"
+        -- Earlier builds marked every session 'active' on first sight, so a
+        -- session discovered by reading a transcript looked like one that was
+        -- running. Only an observed start can support that claim; everything
+        -- else becomes 'unknown'.
+        UPDATE sessions
+           SET status = 'unknown'
+         WHERE status = 'active'
+           AND id NOT IN (
+               SELECT session_id FROM events
+                WHERE kind = 'session.started' AND session_id IS NOT NULL
+           );
+    ",
+    },
 ];
+
+/// The schema version this build expects.
+pub(crate) fn expected_version() -> i64 {
+    MIGRATIONS.last().map_or(0, |migration| migration.version)
+}
+
+/// Reads the version a database is currently at.
+pub(crate) fn current_version(connection: &Connection) -> rusqlite::Result<i64> {
+    connection
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )
+        .or(Ok(0))
+}
 
 /// Applies every migration the database has not seen yet.
 ///
@@ -209,6 +302,81 @@ mod tests {
             );
             previous = migration.version;
         }
+    }
+
+    #[test]
+    fn the_status_migration_only_demotes_unobserved_sessions() {
+        let mut connection = Connection::open_in_memory().expect("in-memory database");
+
+        // Stop before the fix, seed both shapes, then apply the rest.
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY, name TEXT NOT NULL,
+                    applied_at TEXT NOT NULL DEFAULT (datetime('now'))) STRICT;",
+            )
+            .expect("bootstrap");
+        for migration in MIGRATIONS.iter().filter(|m| m.version < 5) {
+            connection.execute_batch(migration.sql).expect("migrate");
+            connection
+                .execute(
+                    "INSERT INTO schema_migrations (version, name) VALUES (?1, ?2)",
+                    rusqlite::params![migration.version, migration.name],
+                )
+                .expect("record");
+        }
+
+        connection
+            .execute_batch(
+                "INSERT INTO sessions (id, agent_id, status, created_at_us)
+                   VALUES ('watched', 'claude-code', 'active', 0),
+                          ('imported', 'claude-code', 'active', 0);
+                 INSERT INTO events
+                   (id, timestamp_us, agent_id, session_id, kind, evidence, confidence, payload, created_at_us)
+                   VALUES ('e1', 0, 'claude-code', 'watched', 'session.started', 'hook', 1.0, '{}', 0);",
+            )
+            .expect("seed");
+
+        apply(&mut connection).expect("apply the rest");
+
+        let watched: String = connection
+            .query_row(
+                "SELECT status FROM sessions WHERE id = 'watched'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("query");
+        let imported: String = connection
+            .query_row(
+                "SELECT status FROM sessions WHERE id = 'imported'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("query");
+
+        assert_eq!(watched, "active", "an observed start should survive");
+        assert_eq!(
+            imported, "unknown",
+            "an unobserved session should be demoted"
+        );
+    }
+
+    #[test]
+    fn expected_version_tracks_the_last_migration() {
+        assert_eq!(
+            expected_version(),
+            MIGRATIONS.last().expect("migrations").version
+        );
+    }
+
+    #[test]
+    fn a_migrated_database_reports_the_expected_version() {
+        let mut connection = Connection::open_in_memory().expect("in-memory database");
+        apply(&mut connection).expect("apply");
+        assert_eq!(
+            current_version(&connection).expect("version"),
+            expected_version()
+        );
     }
 
     #[test]

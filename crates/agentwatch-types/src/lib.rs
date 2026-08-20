@@ -8,8 +8,10 @@
 
 mod ids;
 mod paths;
+mod repository;
 mod timestamp;
 
 pub use ids::{AgentId, EventId, ExternalSessionId, ProjectId, SessionId};
 pub use paths::{DATA_DIR_ENV, PathError, Paths};
+pub use repository::{RepositoryResolver, display_name};
 pub use timestamp::Timestamp;
