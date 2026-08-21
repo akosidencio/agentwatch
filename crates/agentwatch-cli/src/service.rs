@@ -10,6 +10,7 @@
 //! given a menu bar item and quitting the icon never stops collection.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 
@@ -272,6 +273,15 @@ pub(crate) fn resolve_binary(job: Job, explicit: Option<PathBuf>) -> Result<Path
         .with_context(|| format!("resolving {}", binary.display()))
 }
 
+/// How long to wait for launchd to finish tearing a job down.
+///
+/// The daemon flushes queued events on the way out, so its exit is not
+/// instantaneous, and launchd holds the label until the process is gone.
+const UNLOAD_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often that is checked.
+const UNLOAD_POLL: Duration = Duration::from_millis(100);
+
 /// Writes a job definition and loads it, replacing any previous version.
 ///
 /// Unloading before writing matters: replacing the plist under a loaded job
@@ -285,11 +295,42 @@ pub(crate) fn install_job(job: Job, definition: &str) -> Result<PathBuf> {
 
     if is_loaded(job) {
         bootout(job).context("unloading the previous job")?;
+
+        // `bootout` returns as soon as launchd has accepted the request, not
+        // when the job is gone. Bootstrapping a label launchd is still tearing
+        // down fails with `Bootstrap failed: 5: Input/output error` — which is
+        // exactly what an upgrade hit, because the daemon flushes its queue
+        // before exiting. Wait for the label to actually go away.
+        wait_until_unloaded(job)?;
     }
 
     std::fs::write(&path, definition).with_context(|| format!("writing {}", path.display()))?;
     bootstrap(&path).context("loading the job")?;
     Ok(path)
+}
+
+/// Blocks until launchd has forgotten the job.
+///
+/// # Errors
+///
+/// Returns an error if the label is still registered when the timeout expires,
+/// naming the command to run by hand — a job that will not unload is not
+/// something to paper over by bootstrapping on top of it.
+fn wait_until_unloaded(job: Job) -> Result<()> {
+    let deadline = Instant::now() + UNLOAD_TIMEOUT;
+    while is_loaded(job) {
+        if Instant::now() >= deadline {
+            bail!(
+                "{} is still loaded {:?} after being unloaded.\nRun `launchctl bootout gui/{}/{}` and try again.",
+                job.label(),
+                UNLOAD_TIMEOUT,
+                user_id(),
+                job.label()
+            );
+        }
+        std::thread::sleep(UNLOAD_POLL);
+    }
+    Ok(())
 }
 
 /// Loads the job.

@@ -393,14 +393,17 @@ fn apply(paths: &Paths, action: &Action) -> Result<String> {
             paths.ensure_root().context("creating the data directory")?;
             let mut store = Store::open(paths.database()).context("opening the database")?;
             let report = sync::import(&mut store, None)?;
-            let repositories = store
+            store
                 .backfill_repositories(&mut agentwatch_types::RepositoryResolver::new())
                 .context("resolving repositories")?;
+            // Repository count is deliberately left out: `backfill_repositories`
+            // reports what it resolved *this run*, so a re-import prints zero
+            // and "0 repositories" reads as a failure rather than as nothing
+            // left to do.
             Ok(format!(
-                "{} transcripts, {} rows added, {} repositories",
+                "{} transcripts, {} rows added",
                 report.files,
-                render::thousands(report.written as i64),
-                repositories.repositories
+                render::thousands(report.written as i64)
             ))
         }
 
