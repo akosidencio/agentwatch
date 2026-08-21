@@ -75,8 +75,10 @@ jobs:
           # that can be subtly wrong in a binary nobody can rebuild.
           - target: aarch64-apple-darwin
             runner: macos-14
+          # macos-15-intel, not macos-13: GitHub retired the macOS 13 image,
+          # and an unknown label does not fail — it queues forever.
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-15-intel
     steps:
       - uses: actions/checkout@v4
         with:
