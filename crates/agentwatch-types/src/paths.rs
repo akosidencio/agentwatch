@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 /// Environment variable that overrides the data directory.
 pub const DATA_DIR_ENV: &str = "AGENTWATCH_DIR";
 
+/// File name for optional custom command-redaction expressions.
+pub const REDACTION_PATTERNS_FILENAME: &str = "redaction-patterns.txt";
+
 /// Resolved locations for the daemon's data directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
@@ -65,6 +68,12 @@ impl Paths {
     #[must_use]
     pub fn database(&self) -> PathBuf {
         self.root.join("agentwatch.db")
+    }
+
+    /// Optional custom command-redaction expressions, one Rust regex per line.
+    #[must_use]
+    pub fn redaction_patterns(&self) -> PathBuf {
+        self.root.join(REDACTION_PATTERNS_FILENAME)
     }
 
     /// Marker whose presence means collection is paused.
@@ -125,5 +134,9 @@ mod tests {
         let paths = Paths::with_root("/tmp/aw");
         assert_eq!(paths.socket(), Path::new("/tmp/aw/agentwatch.sock"));
         assert_eq!(paths.database(), Path::new("/tmp/aw/agentwatch.db"));
+        assert_eq!(
+            paths.redaction_patterns(),
+            Path::new("/tmp/aw/redaction-patterns.txt")
+        );
     }
 }

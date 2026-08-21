@@ -51,6 +51,7 @@ const GROUPS: [(&str, &[(&str, &str)]); 3] = [
             ("tokens", "usage by project, model, or day"),
             ("security", "access to sensitive paths"),
             ("export", "events as JSON Lines"),
+            ("scrub", "redact secrets from stored commands"),
             ("verify", "re-derive totals from the transcripts"),
         ],
     ),

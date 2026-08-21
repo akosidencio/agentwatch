@@ -284,6 +284,15 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Redact secrets from command lines that are already stored.
+    ///
+    /// Uses the same built-in and custom rules as new event collection. The
+    /// operation is transactional and safe to run repeatedly.
+    Scrub {
+        /// Report how many commands need changes without writing them.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Re-derive totals from agent logs and report any disagreement.
     Verify,
     /// Run the collector in the foreground.
@@ -423,6 +432,7 @@ fn main() -> Result<()> {
         Command::Security { days, limit } => security(&paths, days, limit),
         Command::Export { days, limit, kind } => export(&paths, days, limit, kind),
         Command::Import { limit } => import(&paths, limit),
+        Command::Scrub { dry_run } => scrub(&paths, dry_run),
         Command::Verify => verify(&paths),
         Command::Daemon => agentwatch_daemon::run(),
         // Unreachable in practice: `main` intercepts this before clap runs.
@@ -1285,6 +1295,43 @@ fn import(paths: &Paths, limit: Option<usize>) -> Result<()> {
         "Counting records rather than responses would have inflated every total by {:.2}x.",
         report.record_inflation()
     );
+
+    Ok(())
+}
+
+/// Re-applies the active command-redaction policy to historical rows.
+fn scrub(paths: &Paths, dry_run: bool) -> Result<()> {
+    anyhow::ensure!(
+        paths.database().exists(),
+        "no database yet at {}\nRun `agentwatch init` first.",
+        paths.database().display()
+    );
+
+    let mut store = Store::open(paths.database()).context("opening the database")?;
+    let report = store
+        .scrub_commands(dry_run)
+        .context("scrubbing stored commands")?;
+
+    println!(
+        "commands scanned      {}",
+        render::thousands(report.scanned as i64)
+    );
+    println!(
+        "commands needing scrub {}",
+        render::thousands(report.changed as i64)
+    );
+    println!("custom patterns       {}", report.custom_patterns);
+    println!(
+        "pattern file          {}",
+        paths.redaction_patterns().display()
+    );
+    if report.dry_run {
+        println!("\nDry run only. Re-run without `--dry-run` to apply these changes.");
+    } else if report.changed == 0 {
+        println!("\nNo stored command needed changes.");
+    } else {
+        println!("\nStored command projections and raw event payloads were scrubbed.");
+    }
 
     Ok(())
 }

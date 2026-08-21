@@ -23,6 +23,7 @@ Built in Rust for [Claude Code](https://claude.com/claude-code) and OpenAI Codex
 - [Quick start](#quick-start)
 - [Usage](#usage)
 - [What it records, and what it never records](#what-it-records-and-what-it-never-records)
+- [Security and command redaction](#security-and-command-redaction)
 - [How it works](#how-it-works)
 - [Where it works](#where-it-works)
 - [Known limitations](#known-limitations)
@@ -240,6 +241,8 @@ State is never carried by colour alone: a running daemon is `● running` and a 
 agentwatch export --days 7 --kind command > commands.jsonl
 agentwatch export --days 30 | jq 'select(.kind == "mcp.call")'
 agentwatch import                                   # rescan Claude and Codex history safely
+agentwatch scrub --dry-run                          # find old commands needing redaction
+agentwatch scrub                                    # scrub them transactionally
 agentwatch verify                                   # re-derive totals, report drift
 ```
 
@@ -317,9 +320,27 @@ Never stored, by construction:
 - **Tool output.** `tool_response` is never deserialized at all, so file contents and command output never reach a Rust value, let alone the database.
 - **File contents** from `Write` and `Edit` payloads.
 
-Shell command lines **are** recorded because they are part of the audit trail. Before storage, AgentWatch redacts common token, password, API-key, authorization-header, and URL-credential forms. This is a safety net, not a shell-language secret scanner; unusual or dynamically constructed secrets may still evade it.
+Shell command lines **are** recorded because they are part of the audit trail. They pass through AgentWatch's [command redaction](#security-and-command-redaction) before database insertion.
 
 Nothing leaves your machine. There is no network client in the codebase.
+
+## Security and command redaction
+
+Before storing a command from any adapter, AgentWatch redacts named token/password/API-key environment values and flags, bearer tokens, common provider key shapes, authorization headers, and credentials embedded in URLs. The same sanitized value is written to both the raw event and its queryable command projection.
+
+For private credential formats, put one [Rust regex](https://docs.rs/regex/latest/regex/#syntax) per line in `$AGENTWATCH_DIR/redaction-patterns.txt` (or, with the default data directory, `~/Library/Application Support/AgentWatch/redaction-patterns.txt`):
+
+```text
+# Lines beginning with # and blank lines are ignored.
+ACME-[A-Z0-9]{24}
+(?i)my-company-token[=:][^[:space:]]+
+```
+
+The entire match becomes `[REDACTED: custom]`. New valid rules are picked up on the next write batch; an invalid rule is reported with its line number and stops that batch rather than allowing an unredacted fallback. Patterns that match an empty string are rejected, and Rust's regex engine avoids catastrophic backtracking.
+
+Rules only protect future inserts. After adding rules or upgrading AgentWatch, run `agentwatch scrub --dry-run`, then `agentwatch scrub`. The scrub holds SQLite's writer lock and updates the command projection and raw event JSON in one transaction. It is idempotent, so re-running it is safe.
+
+Redaction is still a safety net, not a shell-language secret scanner; unusual or dynamically constructed secrets may evade it.
 
 ## How it works
 
@@ -357,7 +378,7 @@ These are design consequences, stated up front rather than discovered later.
 - **The Claude hook is configured through a file the monitored agent can edit.** Fine for analytics, disqualifying for anything claiming to be a security control.
 - **Sensitive paths are classified by name, never by reading them.** A credential in an ordinarily-named file is invisible. Reading files to find out would mean AgentWatch handling every secret on the machine, which is a worse position than the one it reports on.
 - **Command lines are scanned, not parsed.** `cat .env` is caught; `eval`, variable expansion, and heredocs are not. Anything recovered this way is labelled `derived` and never mixed in with tool-reported file events.
-- **Command redaction is intentionally conservative, not complete.** Common credential forms are removed before storage, but shell expansion, heredocs, unusual option names, and secrets embedded in arbitrary text can evade it.
+- **Command redaction is intentionally conservative, not complete.** Common credential forms and configured regex matches are removed before storage, but shell expansion, heredocs, and secrets split or constructed at runtime can evade it. Use `agentwatch scrub --dry-run` after adding a private credential pattern.
 - **Collection can be paused, and Claude hook collection can be switched off by editing its settings.** Neither is prevented — nothing running as your own user could prevent it. Both are *recorded*: a pause writes `collection.paused`, and Claude hooks disappearing from the settings file writes `config.changed`. A gap in the timeline should say why it is there rather than looking like an idle agent.
 - **Claude Code web (claude.ai/code) is not monitored, and cannot be.** The agent runs on Anthropic's infrastructure, so there is no local process to hook, no local socket to reach, and no transcript written to your disk. The same applies to cloud and remote sessions. A quiet day in `agentwatch tokens` may only mean you worked in the browser.
 - **`claude` run over SSH monitors the remote machine, not yours.** Hooks and transcripts land on whichever host the agent runs on.
@@ -398,7 +419,7 @@ The one time anything leaves the machine is when you type `agentwatch update`, w
 For Claude Code, the hook adds a measured ~9ms per tool call, and that cost is process spawn rather than anything AgentWatch computes — which is also why [the menu bar is a separate binary](#why-the-menu-bar-is-its-own-binary). It exits 0 on every path, so it cannot fail a tool call even when the daemon is down. Codex uses no per-tool AgentWatch hook; rollout parsing happens in the collector.
 
 **Can it read my prompts or my code?**
-No. Claude prompts are reduced to a character count and hash, Codex prompts are skipped, and tool responses and patch bodies are never deserialized. Shell command lines are retained for the audit trail, with common token, password, API-key, authorization-header, and URL-credential forms redacted before storage.
+No. Claude prompts are reduced to a character count and hash, Codex prompts are skipped, and tool responses and patch bodies are never deserialized. Shell command lines are retained for the audit trail, with common credentials and your configured patterns redacted before storage. `agentwatch scrub` applies the current rules to commands collected by older versions.
 
 **Does it work with Cursor, Codex, Copilot, or Gemini?**
 Claude Code and Codex are supported. Copilot, Cursor, and Gemini do not have adapters yet.

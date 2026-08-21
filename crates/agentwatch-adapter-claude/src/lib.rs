@@ -12,8 +12,8 @@
 //! - Conversation text from transcripts. `message.content` is not deserialized.
 //!
 //! Command lines *are* kept, because a command monitor that hides commands is
-//! pointless. That is a deliberate exception, and it means a command containing
-//! a secret is stored. Phase 4 adds scrubbing for the obvious shapes.
+//! pointless. That is a deliberate exception; storage applies the shared
+//! command redactor before either the raw event or query projection is written.
 
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 

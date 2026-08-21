@@ -1,13 +1,14 @@
 //! The write side.
 
 use agentwatch_events::{
-    AgentEvent, Event, FileEvent, classify, redact_command, scan_command, worst_in_command,
+    AgentEvent, CommandRedactor, Event, FileEvent, RedactionPatternError, classify, scan_command,
+    worst_in_command,
 };
-use agentwatch_types::Timestamp;
+use agentwatch_types::{REDACTION_PATTERNS_FILENAME, Timestamp};
 use rusqlite::{Connection, OpenFlags, Transaction, params};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::migrations;
+use crate::{migrations, redaction};
 
 /// Something went wrong talking to SQLite.
 #[derive(Debug, thiserror::Error)]
@@ -28,14 +29,43 @@ pub enum StoreError {
         expected: i64,
     },
     /// An event could not be encoded for storage.
-    #[error("could not encode event payload")]
+    #[error("could not encode or decode an event payload")]
     Encode(#[from] serde_json::Error),
+    /// The custom redaction file could not be read.
+    #[error("could not read redaction patterns at {path}")]
+    RedactionConfigIo {
+        /// File that could not be read.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// One custom redaction expression is invalid or unsafe.
+    #[error("invalid redaction pattern at {path}:{line}: {source}")]
+    RedactionPattern {
+        /// Configuration file containing the expression.
+        path: PathBuf,
+        /// One-based source line.
+        line: usize,
+        /// Validation failure.
+        #[source]
+        source: RedactionPatternError,
+    },
+    /// A normalized command row points at a non-command raw event.
+    #[error("command row {id} does not contain a command event payload")]
+    CommandPayloadMismatch {
+        /// Event identifier with the broken invariant.
+        id: String,
+    },
 }
 
 /// A connection to the event database.
 #[derive(Debug)]
 pub struct Store {
     pub(crate) connection: Connection,
+    pub(crate) command_redactor: CommandRedactor,
+    redaction_patterns_path: Option<PathBuf>,
+    redaction_patterns_source: String,
 }
 
 impl Store {
@@ -45,10 +75,23 @@ impl Store {
     ///
     /// Returns an error if the file cannot be opened or a migration fails.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let path = path.as_ref();
+        let patterns_path = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(REDACTION_PATTERNS_FILENAME);
+        let patterns_source = redaction::read_patterns(&patterns_path)?;
+        let command_redactor = redaction::compile_patterns(&patterns_path, &patterns_source)?;
+
         let mut connection = Connection::open(path)?;
         Self::configure(&connection)?;
         migrations::apply(&mut connection)?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            command_redactor,
+            redaction_patterns_path: Some(patterns_path),
+            redaction_patterns_source: patterns_source,
+        })
     }
 
     /// Opens an in-memory database, for tests.
@@ -59,7 +102,12 @@ impl Store {
     pub fn open_in_memory() -> Result<Self, StoreError> {
         let mut connection = Connection::open_in_memory()?;
         migrations::apply(&mut connection)?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            command_redactor: CommandRedactor::new(),
+            redaction_patterns_path: None,
+            redaction_patterns_source: String::new(),
+        })
     }
 
     /// Opens the database for reading, for the CLI.
@@ -90,7 +138,12 @@ impl Store {
         }
 
         connection.pragma_update(None, "query_only", "ON")?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            command_redactor: CommandRedactor::new(),
+            redaction_patterns_path: None,
+            redaction_patterns_source: String::new(),
+        })
     }
 
     /// Applies the pragmas the daemon depends on.
@@ -132,17 +185,38 @@ impl Store {
             return Ok(0);
         }
 
+        self.refresh_redaction_patterns()?;
+        let redactor = self.command_redactor.clone();
+
         let transaction = self.connection.transaction()?;
         let mut written = 0;
         for event in events {
             let mut stored = event.clone();
             if let Event::Command(command) = &mut stored.event {
-                command.command = redact_command(&command.command);
+                command.command = redactor.redact(&command.command);
             }
             written += insert_one(&transaction, &stored)?;
         }
         transaction.commit()?;
         Ok(written)
+    }
+
+    /// Reloads a changed custom-pattern file before the next write batch.
+    pub(crate) fn refresh_redaction_patterns(&mut self) -> Result<(), StoreError> {
+        let Some(path) = &self.redaction_patterns_path else {
+            return Ok(());
+        };
+        let source = redaction::read_patterns(path)?;
+        if source == self.redaction_patterns_source {
+            return Ok(());
+        }
+
+        // Compile before replacing either field. A malformed edit stops this
+        // write batch safely and preserves the last valid in-memory rules.
+        let redactor = redaction::compile_patterns(path, &source)?;
+        self.command_redactor = redactor;
+        self.redaction_patterns_source = source;
+        Ok(())
     }
 }
 
@@ -1004,7 +1078,21 @@ mod tests {
 
 #[cfg(test)]
 mod file_backed_tests {
+    use agentwatch_events::{AgentEvent, CommandEvent, Event, EvidenceSource};
+    use agentwatch_types::AgentId;
+
     use super::*;
+
+    fn custom_secret_event(command: &str) -> AgentEvent {
+        AgentEvent::observed(
+            AgentId::CODEX,
+            EvidenceSource::Transcript,
+            Event::Command(CommandEvent {
+                command: command.to_owned(),
+                description: None,
+            }),
+        )
+    }
 
     #[test]
     fn opening_a_fresh_file_applies_every_migration() {
@@ -1016,5 +1104,59 @@ mod file_backed_tests {
 
         let store = Store::open(&path).expect("re-opening must not re-apply");
         drop(store);
+    }
+
+    #[test]
+    fn a_changed_custom_pattern_file_is_applied_before_the_next_batch() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let database = directory.path().join("events.db");
+        let patterns = directory.path().join(REDACTION_PATTERNS_FILENAME);
+        std::fs::write(&patterns, "ACME-[A-Z0-9]{8}\n").expect("patterns");
+        let mut store = Store::open(&database).expect("open");
+
+        store
+            .insert_events(&[custom_secret_event("deploy ACME-12AB34CD")])
+            .expect("first insert");
+        let first: String = store
+            .connection()
+            .query_row("SELECT command FROM command_events", [], |row| row.get(0))
+            .expect("first command");
+        assert_eq!(first, "deploy [REDACTED: custom]");
+
+        std::fs::write(&patterns, "BETA-[A-Z0-9]{8}\n").expect("new patterns");
+        store
+            .insert_events(&[custom_secret_event("deploy BETA-12AB34CD")])
+            .expect("second insert");
+        let second: String = store
+            .connection()
+            .query_row(
+                "SELECT command FROM command_events ORDER BY timestamp_us DESC, id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("second command");
+        assert_eq!(second, "deploy [REDACTED: custom]");
+    }
+
+    #[test]
+    fn an_invalid_pattern_edit_rejects_the_batch_without_partial_writes() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let database = directory.path().join("events.db");
+        let patterns = directory.path().join(REDACTION_PATTERNS_FILENAME);
+        let mut store = Store::open(&database).expect("open");
+        std::fs::write(&patterns, "(unterminated\n").expect("bad pattern");
+
+        let error = store
+            .insert_events(&[custom_secret_event("echo should-not-land")])
+            .expect_err("invalid config must fail closed");
+        assert!(matches!(
+            error,
+            StoreError::RedactionPattern { line: 1, .. }
+        ));
+        let count: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(count, 0);
     }
 }

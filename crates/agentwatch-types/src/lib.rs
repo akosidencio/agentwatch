@@ -16,6 +16,6 @@ mod timestamp;
 pub use format::{compact, thousands};
 pub use hook::{hook_command, is_our_hook_command};
 pub use ids::{AgentId, EventId, ExternalSessionId, ProjectId, SessionId};
-pub use paths::{DATA_DIR_ENV, PathError, Paths};
+pub use paths::{DATA_DIR_ENV, PathError, Paths, REDACTION_PATTERNS_FILENAME};
 pub use repository::{RepositoryResolver, display_name};
 pub use timestamp::Timestamp;
