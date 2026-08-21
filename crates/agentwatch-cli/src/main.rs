@@ -20,7 +20,7 @@ mod welcome;
 
 use std::path::PathBuf;
 
-use agentwatch_storage::{ActivityFilter, Coverage, Store, TokenTotals};
+use agentwatch_storage::{ActivityFilter, Coverage, SessionFilter, Store, TokenTotals};
 use agentwatch_types::Paths;
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
@@ -45,6 +45,8 @@ struct Cli {
 /// How to group a token breakdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum Grouping {
+    /// By coding agent.
+    Agent,
     /// By repository, rolling up every directory inside it.
     Project,
     /// By the exact working directory the session started in.
@@ -100,7 +102,7 @@ enum Command {
         /// Leave the menu bar status item out.
         #[arg(long)]
         no_menu_bar: bool,
-        /// Skip reading the history Claude Code has already written.
+        /// Skip reading the history supported agents have already written.
         #[arg(long)]
         no_import: bool,
     },
@@ -210,6 +212,27 @@ enum Command {
         /// Show what each session's data can and cannot answer.
         #[arg(long)]
         coverage: bool,
+        /// Restrict to agents, for example `claude,codex`.
+        #[arg(long, value_delimiter = ',')]
+        agent: Vec<String>,
+    },
+    /// Show one session receipt (`latest` or an id prefix).
+    Session {
+        /// Session id, unique prefix, or `latest`.
+        #[arg(default_value = "latest")]
+        id: String,
+    },
+    /// Compare usage across agents, models, or projects.
+    Compare {
+        /// Dimension to compare.
+        #[arg(long, value_enum, default_value_t = Grouping::Agent)]
+        by: Grouping,
+        /// Number of calendar days to include, ending today.
+        #[arg(long, default_value_t = 30)]
+        days: u32,
+        /// Show at most this many rows.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
     },
     /// Show a timeline of what agents did.
     Activity {
@@ -253,7 +276,7 @@ enum Command {
         #[arg(long, value_delimiter = ',')]
         kind: Vec<String>,
     },
-    /// Read historical token usage out of Claude Code's own transcripts.
+    /// Read historical telemetry from supported agents' durable local logs.
     ///
     /// Safe to run repeatedly: nothing is double counted.
     Import {
@@ -261,7 +284,7 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
-    /// Re-derive totals from the transcripts and report any disagreement.
+    /// Re-derive totals from agent logs and report any disagreement.
     Verify,
     /// Run the collector in the foreground.
     ///
@@ -374,7 +397,10 @@ fn main() -> Result<()> {
             days,
             limit,
             coverage,
-        } => sessions(&paths, days, limit, coverage),
+            agent,
+        } => sessions(&paths, days, limit, coverage, agent),
+        Command::Session { id } => session(&paths, &id),
+        Command::Compare { by, days, limit } => tokens(&paths, by, days, None, None, false, limit),
         Command::Activity {
             days,
             limit,
@@ -543,6 +569,7 @@ fn tokens(
     print_totals(&totals);
 
     let groups = match by {
+        Grouping::Agent => store.tokens_by_agent(range.from_us, range.to_us),
         Grouping::Project => store.tokens_by_repository(range.from_us, range.to_us),
         Grouping::Directory => store.tokens_by_project(range.from_us, range.to_us),
         Grouping::Model => store.tokens_by_model(range.from_us, range.to_us),
@@ -588,6 +615,7 @@ fn tokens(
 /// The column heading for a grouping.
 const fn by_label(by: Grouping) -> &'static str {
     match by {
+        Grouping::Agent => "agent",
         Grouping::Project => "repository",
         Grouping::Directory => "directory",
         Grouping::Model => "model",
@@ -873,13 +901,28 @@ fn confirm(question: &str) -> Result<bool> {
 }
 
 /// Lists sessions with their counts.
-fn sessions(paths: &Paths, days: u32, limit: u32, show_coverage: bool) -> Result<()> {
+fn sessions(
+    paths: &Paths,
+    days: u32,
+    limit: u32,
+    show_coverage: bool,
+    agents: Vec<String>,
+) -> Result<()> {
     let store = open_for_reading(paths)?;
     let (zone, _) = range::local_zone();
     let range = range::last_days(days, zone);
 
+    let agents = agents
+        .into_iter()
+        .map(|agent| match agent.as_str() {
+            "claude" | "claude-code" => "claude-code".to_owned(),
+            "codex" => "codex".to_owned(),
+            "copilot" | "github-copilot" => "github-copilot".to_owned(),
+            _ => agent,
+        })
+        .collect();
     let rows = store
-        .sessions(range.from_us, range.to_us, limit)
+        .sessions_filtered(range.from_us, range.to_us, limit, &SessionFilter { agents })
         .context("reading sessions")?;
 
     println!("Sessions — {}", range.label);
@@ -909,6 +952,57 @@ fn sessions(paths: &Paths, days: u32, limit: u32, show_coverage: bool) -> Result
         print_coverage(&coverage);
     }
 
+    Ok(())
+}
+
+/// Prints a compact receipt for one session.
+fn session(paths: &Paths, reference: &str) -> Result<()> {
+    let store = open_for_reading(paths)?;
+    let candidates = store
+        .sessions(
+            0,
+            i64::MAX,
+            if reference == "latest" { 100 } else { 10_000 },
+        )
+        .context("reading sessions")?;
+
+    let matches: Vec<_> = if reference == "latest" {
+        let selected = candidates
+            .iter()
+            .position(|row| !row.is_subagent)
+            .unwrap_or(0);
+        candidates.into_iter().nth(selected).into_iter().collect()
+    } else {
+        candidates
+            .into_iter()
+            .filter(|row| row.id.starts_with(reference))
+            .collect()
+    };
+    anyhow::ensure!(!matches.is_empty(), "no session matches `{reference}`");
+    anyhow::ensure!(
+        matches.len() == 1,
+        "session prefix `{reference}` is ambiguous"
+    );
+    let row = &matches[0];
+
+    println!("Session receipt");
+    println!();
+    println!("{}", render::session_header());
+    println!("{}", render::session_line(row));
+
+    let projects = store
+        .projects_for_session(&row.id)
+        .context("reading session projects")?;
+    if projects.len() > 1 {
+        println!();
+        println!("Projects touched:");
+        for project in projects {
+            println!("  {project}");
+        }
+    }
+
+    println!();
+    print_coverage(&store.coverage(&row.id).context("reading coverage")?);
     Ok(())
 }
 
@@ -1032,12 +1126,14 @@ fn import(paths: &Paths, limit: Option<usize>) -> Result<()> {
         .backfill_repositories(&mut agentwatch_types::RepositoryResolver::new())
         .context("resolving repositories")?;
 
-    println!("transcripts read     {}", report.files);
+    println!("source files read    {}", report.files);
+    println!("  Claude transcripts {}", report.claude_files);
+    println!("  Codex rollouts     {}", report.codex_files);
     if report.unreadable > 0 {
         println!("unreadable           {}", report.unreadable);
     }
     println!(
-        "assistant records    {}",
+        "usage records        {}",
         render::thousands(report.records as i64)
     );
     println!(
@@ -1066,7 +1162,7 @@ fn verify(paths: &Paths) -> Result<()> {
     let store = open_for_reading(paths)?;
     let drift = sync::verify(&store)?;
 
-    println!("{:<22} {:>16} {:>16}", "", "transcripts", "stored");
+    println!("{:<22} {:>16} {:>16}", "", "source logs", "stored");
     println!(
         "{:<22} {:>16} {:>16}",
         "responses",

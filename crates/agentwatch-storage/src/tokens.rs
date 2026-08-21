@@ -175,6 +175,61 @@ impl Store {
         )
     }
 
+    /// Breaks token usage down by coding agent, largest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be queried.
+    pub fn tokens_by_agent(&self, from_us: i64, to_us: i64) -> Result<Vec<TokenGroup>, StoreError> {
+        self.token_groups(
+            "SELECT agent_id,
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(cache_creation_input_tokens), 0),
+                    COALESCE(SUM(cache_read_input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0),
+                    COUNT(*)
+               FROM token_usage
+              WHERE timestamp_us >= ?1 AND timestamp_us < ?2
+              GROUP BY agent_id
+              ORDER BY SUM(input_tokens) + SUM(cache_creation_input_tokens)
+                     + SUM(cache_read_input_tokens) + SUM(output_tokens) DESC",
+            from_us,
+            to_us,
+        )
+    }
+
+    /// Sums token usage for one agent over a half-open range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be queried.
+    pub fn token_totals_for_agent(
+        &self,
+        agent: &str,
+        from_us: i64,
+        to_us: i64,
+    ) -> Result<TokenTotals, StoreError> {
+        let totals = self.connection().query_row(
+            "SELECT COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(cache_creation_input_tokens), 0),
+                    COALESCE(SUM(cache_read_input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0), COUNT(*)
+               FROM token_usage
+              WHERE agent_id = ?1 AND timestamp_us >= ?2 AND timestamp_us < ?3",
+            params![agent, from_us, to_us],
+            |row| {
+                Ok(TokenTotals {
+                    input: row.get(0)?,
+                    cache_creation: row.get(1)?,
+                    cache_read: row.get(2)?,
+                    output: row.get(3)?,
+                    responses: row.get(4)?,
+                })
+            },
+        )?;
+        Ok(totals)
+    }
+
     /// Breaks token usage down by day using the caller's timezone resolver.
     ///
     /// The callback receives each row's UTC timestamp. Resolving per row rather
@@ -263,6 +318,7 @@ impl Store {
                FROM sessions s
                LEFT JOIN projects p ON p.id = s.project_id
               WHERE s.reconciled_at_us IS NULL
+                AND s.agent_id = 'claude-code'
                 AND s.external_session_id IS NOT NULL
               ORDER BY COALESCE(s.reconcile_attempted_at_us, 0) ASC,
                        s.started_at_us DESC

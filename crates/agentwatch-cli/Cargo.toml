@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 agentwatch-adapter-claude.workspace = true
+agentwatch-adapter-codex.workspace = true
 agentwatch-daemon.workspace = true
 agentwatch-hook.workspace = true
 agentwatch-events.workspace = true

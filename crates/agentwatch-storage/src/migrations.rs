@@ -286,6 +286,33 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         CREATE INDEX sessions_surface ON sessions (surface);
     ",
     },
+    Migration {
+        version: 9,
+        name: "multi_project_sessions",
+        sql: r"
+        -- A Codex session often starts at a workspace parent and then works in
+        -- one or more child repositories. Keeping every observed directory is
+        -- both more accurate than first-path-wins and preserves cross-repo work.
+        CREATE TABLE session_projects (
+            session_id    TEXT NOT NULL,
+            project_id    TEXT NOT NULL,
+            first_seen_us INTEGER NOT NULL,
+            last_seen_us  INTEGER NOT NULL,
+            event_count   INTEGER NOT NULL,
+            PRIMARY KEY (session_id, project_id)
+        ) STRICT;
+
+        CREATE INDEX session_projects_dominant
+            ON session_projects (session_id, event_count DESC, last_seen_us DESC);
+
+        INSERT INTO session_projects
+            (session_id, project_id, first_seen_us, last_seen_us, event_count)
+        SELECT id, project_id, COALESCE(started_at_us, created_at_us),
+               COALESCE(ended_at_us, started_at_us, created_at_us), 0
+          FROM sessions
+         WHERE project_id IS NOT NULL;
+    ",
+    },
 ];
 
 /// The schema version this build expects.

@@ -11,6 +11,7 @@ mod adapter;
 mod command_scan;
 mod event;
 mod evidence;
+mod redact;
 mod sensitivity;
 mod wire;
 
@@ -21,6 +22,7 @@ pub use event::{
     PromptEvent, SessionEnded, SessionStarted, TokenUsageEvent, ToolCallEvent, UnknownEvent,
 };
 pub use evidence::{Confidence, EvidenceSource};
+pub use redact::redact_command;
 pub use sensitivity::{Sensitivity, classify};
 pub use wire::{
     FrameError, HookEnvelope, HookEnvelopeRef, MAX_FRAME_BYTES, PROTOCOL_VERSION, decode_frame_len,

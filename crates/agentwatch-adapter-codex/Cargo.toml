@@ -1,6 +1,6 @@
 [package]
-name = "agentwatch-daemon"
-description = "The AgentWatch background daemon."
+name = "agentwatch-adapter-codex"
+description = "OpenAI Codex integration for AgentWatch."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,17 +8,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-agentwatch-adapter-claude.workspace = true
-agentwatch-adapter-codex.workspace = true
 agentwatch-events.workspace = true
-agentwatch-storage.workspace = true
 agentwatch-types.workspace = true
-anyhow.workspace = true
+serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
-tokio.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

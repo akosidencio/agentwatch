@@ -38,10 +38,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentwatch-adapter-codex"
+version = "0.1.3"
+dependencies = [
+ "agentwatch-events",
+ "agentwatch-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "agentwatch-cli"
 version = "0.1.3"
 dependencies = [
  "agentwatch-adapter-claude",
+ "agentwatch-adapter-codex",
  "agentwatch-daemon",
  "agentwatch-events",
  "agentwatch-hook",
@@ -62,6 +75,7 @@ name = "agentwatch-daemon"
 version = "0.1.3"
 dependencies = [
  "agentwatch-adapter-claude",
+ "agentwatch-adapter-codex",
  "agentwatch-events",
  "agentwatch-storage",
  "agentwatch-types",

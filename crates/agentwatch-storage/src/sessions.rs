@@ -11,8 +11,14 @@ pub struct SessionRow {
     pub id: String,
     /// The agent that ran it.
     pub agent_id: String,
+    /// Model responsible for the largest share of the session's tokens.
+    pub model: Option<String>,
     /// Repository worked on, falling back to the working directory.
     pub project: Option<String>,
+    /// Distinct working directories observed during the session.
+    pub projects: i64,
+    /// Whether all recorded model responses belong to a spawned subagent.
+    pub is_subagent: bool,
     /// Git branch, when known.
     pub git_branch: Option<String>,
     /// Surface the agent ran in, when known — `claude-vscode`, and so on.
@@ -81,6 +87,13 @@ pub struct ActivityFilter {
     pub project_prefix: Option<String>,
 }
 
+/// Restrictions for a session listing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionFilter {
+    /// Agent identifiers to include. Empty means every agent.
+    pub agents: Vec<String>,
+}
+
 impl Store {
     /// Lists sessions in a range, most recent first.
     ///
@@ -93,10 +106,45 @@ impl Store {
         to_us: i64,
         limit: u32,
     ) -> Result<Vec<SessionRow>, StoreError> {
-        let mut statement = self.connection().prepare(
+        self.sessions_filtered(from_us, to_us, limit, &SessionFilter::default())
+    }
+
+    /// Lists sessions in a range, optionally restricted to several agents.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be queried.
+    pub fn sessions_filtered(
+        &self,
+        from_us: i64,
+        to_us: i64,
+        limit: u32,
+        filter: &SessionFilter,
+    ) -> Result<Vec<SessionRow>, StoreError> {
+        let mut sql = String::from(
             "SELECT s.id,
                     s.agent_id,
-                    COALESCE(r.root, p.path),
+                    (SELECT model
+                       FROM token_usage
+                      WHERE session_id = s.id
+                      GROUP BY model
+                      ORDER BY SUM(input_tokens + cache_creation_input_tokens
+                                   + cache_read_input_tokens + output_tokens) DESC
+                      LIMIT 1),
+                    COALESCE(
+                        (SELECT COALESCE(sr.root, spath.path)
+                           FROM session_projects sp
+                           JOIN projects spath ON spath.id = sp.project_id
+                           LEFT JOIN repositories sr ON sr.id = spath.repository_id
+                          WHERE sp.session_id = s.id
+                          ORDER BY sp.event_count DESC, sp.last_seen_us DESC
+                          LIMIT 1),
+                        r.root, p.path),
+                    (SELECT COUNT(*) FROM session_projects WHERE session_id = s.id),
+                    EXISTS(SELECT 1 FROM token_usage
+                            WHERE session_id = s.id AND is_subagent = 1)
+                    AND NOT EXISTS(SELECT 1 FROM token_usage
+                                    WHERE session_id = s.id AND is_subagent = 0),
                     s.git_branch,
                     s.surface,
                     s.started_at_us,
@@ -117,27 +165,50 @@ impl Store {
                LEFT JOIN repositories r ON r.id = s.repository_id
                LEFT JOIN projects p     ON p.id = s.project_id
               WHERE COALESCE(s.started_at_us, 0) >= ?1
-                AND COALESCE(s.started_at_us, 0) < ?2
-              ORDER BY s.started_at_us DESC
-              LIMIT ?3",
-        )?;
+                AND COALESCE(s.started_at_us, 0) < ?2",
+        );
 
-        let rows = statement.query_map(params![from_us, to_us, limit], |row| {
+        let mut bindings: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(from_us), Box::new(to_us)];
+        if !filter.agents.is_empty() {
+            let placeholders: Vec<String> = filter
+                .agents
+                .iter()
+                .map(|agent| {
+                    bindings.push(Box::new(agent.clone()));
+                    format!("?{}", bindings.len())
+                })
+                .collect();
+            sql.push_str(&format!(" AND s.agent_id IN ({})", placeholders.join(", ")));
+        }
+        bindings.push(Box::new(limit));
+        sql.push_str(&format!(
+            " ORDER BY s.started_at_us DESC LIMIT ?{}",
+            bindings.len()
+        ));
+
+        let mut statement = self.connection().prepare(&sql)?;
+        let parameters: Vec<&dyn rusqlite::ToSql> =
+            bindings.iter().map(std::convert::AsRef::as_ref).collect();
+
+        let rows = statement.query_map(parameters.as_slice(), |row| {
             Ok(SessionRow {
                 id: row.get(0)?,
                 agent_id: row.get(1)?,
-                project: row.get(2)?,
-                git_branch: row.get(3)?,
-                surface: row.get(4)?,
-                started_at_us: row.get(5)?,
-                duration_ms: row.get(6)?,
-                status: row.get(7)?,
-                tokens: row.get(8)?,
-                responses: row.get(9)?,
-                commands: row.get(10)?,
-                files: row.get(11)?,
-                mcp_calls: row.get(12)?,
-                sensitive: row.get(13)?,
+                model: row.get(2)?,
+                project: row.get(3)?,
+                projects: row.get(4)?,
+                is_subagent: row.get(5)?,
+                git_branch: row.get(6)?,
+                surface: row.get(7)?,
+                started_at_us: row.get(8)?,
+                duration_ms: row.get(9)?,
+                status: row.get(10)?,
+                tokens: row.get(11)?,
+                responses: row.get(12)?,
+                commands: row.get(13)?,
+                files: row.get(14)?,
+                mcp_calls: row.get(15)?,
+                sensitive: row.get(16)?,
             })
         })?;
 
@@ -181,6 +252,31 @@ impl Store {
             },
         )?;
         Ok(coverage)
+    }
+
+    /// Lists every path associated with a session, busiest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be queried.
+    pub fn projects_for_session(&self, session_id: &str) -> Result<Vec<String>, StoreError> {
+        let mut statement = self.connection().prepare(
+            "SELECT COALESCE(r.root, p.path)
+               FROM session_projects sp
+               JOIN projects p ON p.id = sp.project_id
+               LEFT JOIN repositories r ON r.id = p.repository_id
+              WHERE sp.session_id = ?1
+              ORDER BY sp.event_count DESC, sp.last_seen_us DESC",
+        )?;
+        let rows = statement.query_map([session_id], |row| row.get(0))?;
+        let mut projects = Vec::new();
+        for row in rows {
+            let project: String = row?;
+            if !projects.contains(&project) {
+                projects.push(project);
+            }
+        }
+        Ok(projects)
     }
 
     /// Lists events in a range, oldest first, subject to filters.
@@ -508,5 +604,57 @@ mod tests {
             events[1].kind, "session.ended",
             "a limit should keep the newest, still shown oldest first"
         );
+    }
+
+    #[test]
+    fn session_filter_accepts_several_agents_and_prefers_the_busy_child_project() {
+        let mut store = Store::open_in_memory().expect("schema");
+        let event = |agent: AgentId, session: &str, project: &str, micros: i64| {
+            AgentEvent::observed(
+                agent,
+                EvidenceSource::Transcript,
+                Event::Command(CommandEvent {
+                    command: "cargo test".to_owned(),
+                    description: None,
+                }),
+            )
+            .with_session(ExternalSessionId::from(session.to_owned()))
+            .with_project_path(project.to_owned())
+            .at(Timestamp::from_micros(micros))
+        };
+        store
+            .insert_events(&[
+                event(AgentId::CODEX, "codex-1", "/work", 1),
+                event(AgentId::CODEX, "codex-1", "/work/app", 2),
+                event(AgentId::CODEX, "codex-1", "/work/app", 3),
+                event(AgentId::CLAUDE_CODE, "claude-1", "/work/other", 4),
+            ])
+            .expect("insert");
+
+        let codex = store
+            .sessions_filtered(
+                0,
+                i64::MAX,
+                10,
+                &SessionFilter {
+                    agents: vec!["codex".to_owned()],
+                },
+            )
+            .expect("sessions");
+        assert_eq!(codex.len(), 1);
+        assert_eq!(codex[0].project.as_deref(), Some("/work/app"));
+        assert_eq!(codex[0].projects, 2);
+
+        let unified = store
+            .sessions_filtered(
+                0,
+                i64::MAX,
+                10,
+                &SessionFilter {
+                    agents: vec!["codex".to_owned(), "claude-code".to_owned()],
+                },
+            )
+            .expect("sessions");
+        assert_eq!(unified.len(), 2);
     }
 }

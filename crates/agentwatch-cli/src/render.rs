@@ -22,8 +22,10 @@ pub(crate) const SECURITY_CAVEAT: &str = concat!(
 pub(crate) fn session_header() -> String {
     theme::paint(
         &format!(
-            "{:<8}  {:<16}  {:<9}  {:>13}  {:>4}  {:>4}  {:>4}  {:>4}  {:<13}  {}",
+            "{:<8}  {:<11}  {:<18}  {:<16}  {:<9}  {:>13}  {:>4}  {:>4}  {:>4}  {:>4}  {:<13}  {}",
             "session",
+            "agent",
+            "model",
             "started",
             "duration",
             "tokens",
@@ -53,10 +55,13 @@ pub(crate) fn session_line(row: &SessionRow) -> String {
     );
 
     let home = std::env::var("HOME").ok();
-    let project = row
+    let mut project = row
         .project
         .as_deref()
         .map_or_else(|| "-".to_owned(), |path| short_path(path, home.as_deref()));
+    if row.projects > 1 {
+        project.push_str(&format!(" (+{} paths)", row.projects - 1));
+    }
 
     let sensitive = if row.sensitive > 0 {
         row.sensitive.to_string()
@@ -67,6 +72,7 @@ pub(crate) fn session_line(row: &SessionRow) -> String {
     // Never observed, rather than a default. Only transcripts carry the field,
     // so a session seen purely through hooks has none until it is reconciled.
     let surface = row.surface.as_deref().unwrap_or("?");
+    let model = row.model.as_deref().unwrap_or("?");
 
     // Painted per column, not per line: the identity, the liveness, and the
     // one number worth a second look each carry their own meaning, and a line
@@ -95,7 +101,8 @@ pub(crate) fn session_line(row: &SessionRow) -> String {
     let started = theme::paint(&format!("{started:<16}"), theme::MUTED);
 
     format!(
-        "{id}  {started}  {duration}  {:>13}  {:>4}  {:>4}  {:>4}  {sensitive}  {surface}  {project}",
+        "{id}  {:<11}  {model:<18}  {started}  {duration}  {:>13}  {:>4}  {:>4}  {:>4}  {sensitive}  {surface}  {project}",
+        row.agent_id,
         thousands(row.tokens),
         row.commands,
         row.files,
@@ -407,7 +414,10 @@ mod tests {
         let row = SessionRow {
             id: "abcdef1234".to_owned(),
             agent_id: "claude-code".to_owned(),
+            model: None,
             project: Some("/work/acme".to_owned()),
+            projects: 1,
+            is_subagent: false,
             git_branch: None,
             surface: Some("claude-vscode".to_owned()),
             started_at_us: Some(1_755_000_000_000_000),
@@ -430,7 +440,10 @@ mod tests {
         let row = SessionRow {
             id: "abcdef1234".to_owned(),
             agent_id: "claude-code".to_owned(),
+            model: None,
             project: None,
+            projects: 0,
+            is_subagent: false,
             git_branch: None,
             surface: Some("claude-vscode".to_owned()),
             started_at_us: Some(1),
@@ -451,7 +464,10 @@ mod tests {
         let row = SessionRow {
             id: "abcdef1234".to_owned(),
             agent_id: "claude-code".to_owned(),
+            model: None,
             project: None,
+            projects: 0,
+            is_subagent: false,
             git_branch: None,
             surface: None,
             started_at_us: Some(1),
@@ -466,7 +482,7 @@ mod tests {
         };
         let line = session_line(&row);
         assert!(line.contains('?'), "{line}");
-        assert!(!line.contains("claude"), "must not invent a surface");
+        assert!(!line.contains("claude-vscode"), "must not invent a surface");
     }
 
     #[test]
@@ -474,7 +490,10 @@ mod tests {
         let row = SessionRow {
             id: "abcdef1234".to_owned(),
             agent_id: "claude-code".to_owned(),
+            model: None,
             project: None,
+            projects: 0,
+            is_subagent: false,
             git_branch: None,
             surface: Some("claude-vscode".to_owned()),
             started_at_us: Some(1_755_000_000_000_000),
@@ -500,7 +519,10 @@ mod tests {
         let row = SessionRow {
             id: "abcdef1234".to_owned(),
             agent_id: "claude-code".to_owned(),
+            model: None,
             project: None,
+            projects: 0,
+            is_subagent: false,
             git_branch: None,
             surface: Some("claude-vscode".to_owned()),
             started_at_us: None,

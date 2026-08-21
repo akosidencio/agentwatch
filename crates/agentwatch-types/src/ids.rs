@@ -26,6 +26,9 @@ impl AgentId {
     /// The Claude Code agent.
     pub const CLAUDE_CODE: Self = Self(Cow::Borrowed("claude-code"));
 
+    /// OpenAI Codex.
+    pub const CODEX: Self = Self(Cow::Borrowed("codex"));
+
     /// Wraps a statically known agent name.
     #[must_use]
     pub const fn from_static(id: &'static str) -> Self {

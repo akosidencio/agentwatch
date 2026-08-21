@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agentwatch_adapter_claude::{derived_transcript_path, read_token_usage, transcript_root};
+use agentwatch_adapter_codex::{find_rollouts, read_rollout, rollout_root};
 use agentwatch_storage::{PendingSession, Store, StoreError};
 use agentwatch_types::{RepositoryResolver, Timestamp};
 
@@ -45,6 +46,8 @@ pub struct ReconcileReport {
     pub written: u64,
     /// Sessions that will never be read again.
     pub finished: u64,
+    /// Codex rollout files examined.
+    pub codex_rollouts: u64,
 }
 
 /// Reads one session's transcript and stores whatever it reports.
@@ -153,21 +156,48 @@ fn locate_transcript(session: &PendingSession, root: &Path) -> Option<PathBuf> {
 ///
 /// Returns an error if the database cannot be queried or written.
 pub fn sweep(store: &mut Store) -> Result<ReconcileReport, StoreError> {
-    let Ok(root) = transcript_root() else {
-        tracing::warn!("cannot locate the transcript directory; skipping reconcile");
-        return Ok(ReconcileReport::default());
-    };
+    sweep_with_local_history(store, true)
+}
 
-    let pending = store.sessions_awaiting_reconcile(SWEEP_LIMIT)?;
+/// Reconciles durable sources, optionally excluding agent-home discovery.
+///
+/// Explicitly configured daemon instances use `false` to remain isolated from
+/// the host user's history. The normal CLI daemon always uses `true`.
+pub(crate) fn sweep_with_local_history(
+    store: &mut Store,
+    include_agent_homes: bool,
+) -> Result<ReconcileReport, StoreError> {
     let mut report = ReconcileReport::default();
+    if let Ok(root) = transcript_root() {
+        let pending = store.sessions_awaiting_reconcile(SWEEP_LIMIT)?;
+        for session in &pending {
+            let one = reconcile_session(store, session, &root)?;
+            report.sessions += one.sessions;
+            report.missing_transcripts += one.missing_transcripts;
+            report.responses += one.responses;
+            report.written += one.written;
+            report.finished += one.finished;
+        }
+    } else {
+        tracing::warn!("cannot locate the Claude transcript directory; skipping Claude reconcile");
+    }
 
-    for session in &pending {
-        let one = reconcile_session(store, session, &root)?;
-        report.sessions += one.sessions;
-        report.missing_transcripts += one.missing_transcripts;
-        report.responses += one.responses;
-        report.written += one.written;
-        report.finished += one.finished;
+    // Codex has no hook yet, so its durable rollout is both fast and repairing
+    // path. Re-reading is safe: every normalized event id and usage key is
+    // deterministic, including for the rollout currently being appended.
+    if include_agent_homes && let Ok(root) = rollout_root() {
+        for path in find_rollouts(&root) {
+            report.codex_rollouts += 1;
+            match read_rollout(&path) {
+                Ok((events, summary)) => {
+                    report.responses += summary.responses;
+                    report.written += store.insert_events(&events)? as u64;
+                }
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), ?error, "Codex rollout could not be read")
+                }
+            }
+        }
     }
 
     // Same cadence as the rest of the sweep: cheap, and a change made while we
@@ -188,9 +218,10 @@ pub fn sweep(store: &mut Store) -> Result<ReconcileReport, StoreError> {
         Err(error) => tracing::error!(?error, "repository backfill failed"),
     }
 
-    if report.sessions > 0 {
+    if report.sessions > 0 || report.codex_rollouts > 0 {
         tracing::info!(
             sessions = report.sessions,
+            codex_rollouts = report.codex_rollouts,
             responses = report.responses,
             written = report.written,
             missing = report.missing_transcripts,

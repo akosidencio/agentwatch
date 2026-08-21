@@ -1,6 +1,8 @@
 //! The write side.
 
-use agentwatch_events::{AgentEvent, Event, FileEvent, classify, scan_command, worst_in_command};
+use agentwatch_events::{
+    AgentEvent, Event, FileEvent, classify, redact_command, scan_command, worst_in_command,
+};
 use agentwatch_types::Timestamp;
 use rusqlite::{Connection, OpenFlags, Transaction, params};
 use std::path::Path;
@@ -133,7 +135,11 @@ impl Store {
         let transaction = self.connection.transaction()?;
         let mut written = 0;
         for event in events {
-            written += insert_one(&transaction, event)?;
+            let mut stored = event.clone();
+            if let Event::Command(command) = &mut stored.event {
+                command.command = redact_command(&command.command);
+            }
+            written += insert_one(&transaction, &stored)?;
         }
         transaction.commit()?;
         Ok(written)
@@ -193,6 +199,18 @@ fn insert_one(transaction: &Transaction<'_>, event: &AgentEvent) -> Result<usize
 
     if let Some(session_id) = event.session_id {
         upsert_session(transaction, event, &session_id.to_string(), timestamp, now)?;
+        if let Some(project_id) = event.project_id {
+            transaction.execute(
+                "INSERT INTO session_projects
+                    (session_id, project_id, first_seen_us, last_seen_us, event_count)
+                 VALUES (?1, ?2, ?3, ?3, 1)
+                 ON CONFLICT(session_id, project_id) DO UPDATE SET
+                    first_seen_us = MIN(first_seen_us, excluded.first_seen_us),
+                    last_seen_us  = MAX(last_seen_us, excluded.last_seen_us),
+                    event_count   = event_count + 1",
+                params![session_id.to_string(), project_id.to_string(), timestamp],
+            )?;
+        }
     }
 
     write_projection(transaction, event, now)?;
@@ -401,6 +419,7 @@ fn upsert_session(
             git_branch      = COALESCE(excluded.git_branch, sessions.git_branch),
             surface         = COALESCE(excluded.surface, sessions.surface),
             status          = CASE
+                                WHEN excluded.status = 'active' THEN 'active'
                                 WHEN sessions.status = 'unknown' THEN excluded.status
                                 ELSE sessions.status
                               END",

@@ -1,6 +1,7 @@
 //! Reading history out of transcripts, and checking that it stayed right.
 
 use agentwatch_adapter_claude::{find_transcripts, read_token_usage, transcript_root};
+use agentwatch_adapter_codex::{find_rollouts, read_rollout, rollout_root};
 use agentwatch_events::Event;
 use agentwatch_storage::Store;
 use anyhow::{Context as _, Result};
@@ -18,6 +19,10 @@ pub(crate) struct ImportReport {
     pub(crate) responses: u64,
     /// Rows actually written, after deduplication against what was stored.
     pub(crate) written: u64,
+    /// Claude transcript files read.
+    pub(crate) claude_files: u64,
+    /// Codex rollout files read.
+    pub(crate) codex_files: u64,
 }
 
 impl ImportReport {
@@ -41,26 +46,53 @@ impl ImportReport {
 /// database cannot be written. An individual unreadable file is counted, not
 /// raised — one corrupt transcript should not block importing the rest.
 pub(crate) fn import(store: &mut Store, limit: Option<usize>) -> Result<ImportReport> {
-    let root = transcript_root().context("locating the transcript directory")?;
-    let mut files = find_transcripts(&root);
+    enum Source {
+        Claude(std::path::PathBuf),
+        Codex(std::path::PathBuf),
+    }
+
+    let mut files = Vec::new();
+    if let Ok(root) = transcript_root() {
+        files.extend(find_transcripts(&root).into_iter().map(Source::Claude));
+    }
+    if let Ok(root) = rollout_root() {
+        files.extend(find_rollouts(&root).into_iter().map(Source::Codex));
+    }
     if let Some(limit) = limit {
         files.truncate(limit);
     }
 
     let mut report = ImportReport::default();
-    for file in &files {
+    for source in &files {
         report.files += 1;
-
-        let Ok((events, summary)) = read_token_usage(file) else {
-            report.unreadable += 1;
-            continue;
+        let events = match source {
+            Source::Claude(file) => {
+                report.claude_files += 1;
+                let Ok((events, summary)) = read_token_usage(file) else {
+                    report.unreadable += 1;
+                    continue;
+                };
+                report.records += summary.usage_records;
+                report.responses += summary.responses;
+                events
+            }
+            Source::Codex(file) => {
+                report.codex_files += 1;
+                let Ok((events, summary)) = read_rollout(file) else {
+                    report.unreadable += 1;
+                    continue;
+                };
+                report.records += summary.responses;
+                report.responses += summary.responses;
+                events
+            }
         };
-
-        report.records += summary.usage_records;
-        report.responses += summary.responses;
+        let display = match source {
+            Source::Claude(file) | Source::Codex(file) => file.display(),
+        };
         report.written += store
             .insert_events(&events)
-            .with_context(|| format!("storing events from {}", file.display()))?
+            .with_context(|| format!("storing events from {display}"))?
             as u64;
     }
 
@@ -99,32 +131,48 @@ impl Drift {
 ///
 /// Returns an error if the transcripts or the database cannot be read.
 pub(crate) fn verify(store: &Store) -> Result<Drift> {
-    let root = transcript_root().context("locating the transcript directory")?;
-
     let mut transcript_responses = 0_i64;
     let mut transcript_tokens = 0_i64;
 
-    for file in find_transcripts(&root) {
-        let Ok((events, _)) = read_token_usage(&file) else {
-            continue;
-        };
-        for event in events {
-            if let Event::TokenUsage(usage) = event.event {
-                transcript_responses += 1;
-                transcript_tokens += i64::try_from(usage.total()).unwrap_or(i64::MAX);
+    if let Ok(root) = transcript_root() {
+        for file in find_transcripts(&root) {
+            let Ok((events, _)) = read_token_usage(&file) else {
+                continue;
+            };
+            for event in events {
+                if let Event::TokenUsage(usage) = event.event {
+                    transcript_responses += 1;
+                    transcript_tokens += i64::try_from(usage.total()).unwrap_or(i64::MAX);
+                }
+            }
+        }
+    }
+    if let Ok(root) = rollout_root() {
+        for file in find_rollouts(&root) {
+            let Ok((events, _)) = read_rollout(&file) else {
+                continue;
+            };
+            for event in events {
+                if let Event::TokenUsage(usage) = event.event {
+                    transcript_responses += 1;
+                    transcript_tokens += i64::try_from(usage.total()).unwrap_or(i64::MAX);
+                }
             }
         }
     }
 
-    let stored = store
-        .token_totals(0, i64::MAX)
-        .context("reading stored totals")?;
+    let claude = store
+        .token_totals_for_agent("claude-code", 0, i64::MAX)
+        .context("reading Claude totals")?;
+    let codex = store
+        .token_totals_for_agent("codex", 0, i64::MAX)
+        .context("reading Codex totals")?;
 
     Ok(Drift {
         transcript_responses,
-        stored_responses: stored.responses,
+        stored_responses: claude.responses + codex.responses,
         transcript_tokens,
-        stored_tokens: stored.total(),
+        stored_tokens: claude.total() + codex.total(),
     })
 }
 

@@ -375,7 +375,10 @@ mod tests {
         SessionRow {
             id: "abcdef1234567890".to_owned(),
             agent_id: "claude-code".to_owned(),
+            model: Some("claude-opus".to_owned()),
             project: Some("/work/acme".to_owned()),
+            projects: 1,
+            is_subagent: false,
             git_branch: Some("main".to_owned()),
             surface: Some("claude-vscode".to_owned()),
             started_at_us: Some(1_755_000_000_000_000),

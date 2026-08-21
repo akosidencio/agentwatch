@@ -15,6 +15,7 @@ default-members = [
     "crates/agentwatch-events",
     "crates/agentwatch-storage",
     "crates/agentwatch-adapter-claude",
+    "crates/agentwatch-adapter-codex",
     "crates/agentwatch-cli",
     "crates/agentwatch-daemon",
     "crates/agentwatch-hook",
@@ -32,6 +33,7 @@ agentwatch-types = { path = "crates/agentwatch-types" }
 agentwatch-events = { path = "crates/agentwatch-events" }
 agentwatch-storage = { path = "crates/agentwatch-storage" }
 agentwatch-adapter-claude = { path = "crates/agentwatch-adapter-claude" }
+agentwatch-adapter-codex = { path = "crates/agentwatch-adapter-codex" }
 agentwatch-daemon = { path = "crates/agentwatch-daemon" }
 agentwatch-hook = { path = "crates/agentwatch-hook" }
 agentwatch-menubar = { path = "crates/agentwatch-menubar" }

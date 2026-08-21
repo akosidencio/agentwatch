@@ -47,13 +47,28 @@ const RECONCILE_DEBOUNCE: Duration = Duration::from_secs(2);
 pub struct DaemonConfig {
     /// Where the socket and database live.
     pub paths: Paths,
+    /// Whether to reconcile durable logs found in the user's agent homes.
+    pub import_local_history: bool,
 }
 
 impl DaemonConfig {
     /// Builds configuration for an explicit data directory.
     #[must_use]
     pub const fn new(paths: Paths) -> Self {
-        Self { paths }
+        Self {
+            paths,
+            import_local_history: false,
+        }
+    }
+
+    /// Enables or disables discovery of durable logs in agent home directories.
+    ///
+    /// Explicit configurations default to disabled so an embedded or test
+    /// daemon does not unexpectedly ingest the host user's history.
+    #[must_use]
+    pub const fn with_local_history(mut self, enabled: bool) -> Self {
+        self.import_local_history = enabled;
+        self
     }
 
     /// Reads configuration from the environment.
@@ -63,7 +78,7 @@ impl DaemonConfig {
     /// Returns an error if the data directory cannot be resolved.
     pub fn from_env() -> Result<Self> {
         let paths = Paths::from_env().context("resolving the data directory")?;
-        Ok(Self { paths })
+        Ok(Self::new(paths).with_local_history(true))
     }
 }
 
@@ -89,6 +104,7 @@ impl Daemon {
     /// propagated.
     pub async fn run(self) -> Result<()> {
         let paths = &self.config.paths;
+        let import_local_history = self.config.import_local_history;
         paths.ensure_root().context("creating the data directory")?;
 
         let store = Store::open(paths.database()).context("opening the database")?;
@@ -106,7 +122,7 @@ impl Daemon {
             let database = paths.database();
             let caught_up = tokio::task::spawn_blocking(move || {
                 let mut store = Store::open(&database)?;
-                reconcile::sweep(&mut store)
+                reconcile::sweep_with_local_history(&mut store, import_local_history)
             })
             .await;
             if let Ok(Err(error)) = caught_up {
@@ -125,7 +141,11 @@ impl Daemon {
             events,
             Arc::clone(&session_ended),
         ));
-        let reconciler = tokio::spawn(reconcile_loop(paths.database(), Arc::clone(&session_ended)));
+        let reconciler = tokio::spawn(reconcile_loop(
+            paths.database(),
+            Arc::clone(&session_ended),
+            import_local_history,
+        ));
 
         shutdown_signal().await;
         tracing::info!("shutting down; flushing queued events");
@@ -159,7 +179,11 @@ impl Daemon {
 /// Runs on its own database connection rather than borrowing the writer's. WAL
 /// allows the second connection, and it keeps a slow scan over months of
 /// history off the path that ingestion depends on.
-async fn reconcile_loop(database: std::path::PathBuf, session_ended: Arc<Notify>) {
+async fn reconcile_loop(
+    database: std::path::PathBuf,
+    session_ended: Arc<Notify>,
+    import_local_history: bool,
+) {
     loop {
         let nudged = tokio::select! {
             () = session_ended.notified() => true,
@@ -173,7 +197,7 @@ async fn reconcile_loop(database: std::path::PathBuf, session_ended: Arc<Notify>
         let database = database.clone();
         let outcome = tokio::task::spawn_blocking(move || {
             let mut store = Store::open(&database)?;
-            reconcile::sweep(&mut store)
+            reconcile::sweep_with_local_history(&mut store, import_local_history)
         })
         .await;
 

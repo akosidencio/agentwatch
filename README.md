@@ -1,15 +1,15 @@
 # AgentWatch — local-first monitoring for AI coding agents
 
-**AgentWatch records what your AI coding agent actually does on your machine — sessions, files read and written, shell commands, MCP calls, and token usage — into a local SQLite database. No accounts, no telemetry, no network calls.**
+**AgentWatch records what your AI coding agents actually do on your machine — sessions, files read and written, shell commands, MCP calls, and token usage — into a local SQLite database. No accounts, no uploads, no outbound telemetry.**
 
-Built in Rust for [Claude Code](https://claude.com/claude-code) on macOS. Everything stays on the box it was collected on.
+Built in Rust for [Claude Code](https://claude.com/claude-code) and OpenAI Codex on macOS. Everything stays on the box it was collected on.
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)](#requirements)
 [![Rust 1.90+](https://img.shields.io/badge/rust-1.90%2B-orange.svg)](#build-from-source)
 [![Status: v0.1.0](https://img.shields.io/badge/status-v0.1.0-yellow.svg)](#roadmap)
 
-**Keywords:** AI agent monitoring · Claude Code token usage · local-first observability · agent audit log · developer telemetry without telemetry · Rust CLI · SQLite
+**Keywords:** AI agent monitoring · Claude Code telemetry · OpenAI Codex telemetry · local-first observability · agent audit log · Rust CLI · SQLite
 
 ---
 
@@ -36,7 +36,7 @@ Built in Rust for [Claude Code](https://claude.com/claude-code) on macOS. Everyt
 
 ## What AgentWatch does
 
-AgentWatch attaches to Claude Code through its hook system and writes a normalized event stream to `~/.agentwatch/agentwatch.db`:
+AgentWatch attaches to Claude Code through its hook system and reads Codex's durable local rollout log, writing both into one normalized event stream at `~/.agentwatch/agentwatch.db`:
 
 | It records | So you can ask |
 |---|---|
@@ -49,15 +49,32 @@ AgentWatch attaches to Claude Code through its hook system and writes a normaliz
 
 It ships four surfaces over one storage layer: a pipeable CLI (`agentwatch tokens`, `sessions`, `activity`, `security`, `export`), a live full-screen TUI (`agentwatch watch`), a macOS menu bar app, and a JSON Lines export for everything else.
 
-Token totals are exact. `agentwatch verify` re-derives them from Claude Code's own transcripts and reports any drift — currently **0 drift across 149 transcripts and 5,998,457,883 tokens**.
+Token totals are duplicate-safe. `agentwatch verify` re-derives them from Claude transcripts and Codex rollouts and reports any drift.
+
+Codex frequently reports a workspace parent as the session `cwd`, even when a
+tool is operating in a child repository. AgentWatch also correlates tool
+working directories and changed-file paths, keeps every project touched, and
+shows the busiest repository as the session's primary project.
+
+### Adapter coverage
+
+| Capability | Claude Code | Codex |
+|---|---|---|
+| Sessions, surface, model, token usage | Yes | Yes |
+| Shell commands | Hook-observed | Recovered from rollout exec calls |
+| File writes | Hook-observed | Patch paths, without patch contents |
+| File reads | Hook-observed | Not currently available as structured events |
+| MCP calls | Hook-observed | Generic tool metadata where reported |
+| Prompt handling | Length and SHA-256 only | Prompt is not deserialized |
+| Freshness | Immediate hooks, then transcript repair | Startup import and five-minute reconciliation |
 
 ## What it solves
 
-**You cannot see what your agents are doing.** Claude Code shows you the current session and nothing else. There is no history, no cross-project rollup, no answer to "what has this thing been doing all week."
+**You cannot see what your agents are doing in one place.** Claude Code and Codex each expose their current work differently. Neither gives you a durable cross-agent, cross-project rollup or an answer to "what have these things been doing all week?"
 
 **Token usage is invisible until the bill or the limit arrives.** AgentWatch breaks usage down by repository, model, and calendar day, over all of your history — not just since you installed it.
 
-**Naive token counting is silently wrong.** One API response is written to the transcript as *several* records, one per content block, each repeating the whole response's usage. Counting records instead of responses inflates totals by **1.92x** on the real corpus here (3.08x on input tokens alone). AgentWatch deduplicates by `message.id` and enforces it with a unique index, so a reconcile pass can run any number of times without a total moving.
+**Naive token counting is silently wrong.** Claude can repeat one response's usage across several content-block records, while Codex can repeat the same cumulative token snapshot. AgentWatch uses each source's stable response identity and enforces uniqueness in SQLite, so imports and reconcile passes can run repeatedly without moving a total.
 
 **Agents run shell commands you never see.** `agentwatch activity` and `agentwatch security` give you the timeline after the fact, including file access recovered from inside `Bash` commands — labelled `derived`, never mixed in with what a tool actually reported.
 
@@ -66,29 +83,28 @@ Token totals are exact. `agentwatch verify` re-derives them from Claude Code's o
 ## Requirements
 
 - macOS (Apple Silicon or Intel)
-- Claude Code installed
+- Claude Code and/or Codex installed
 - Nothing else. SQLite is bundled; there is no runtime to install.
 
-Linux, Windows, and other agents (Codex, Gemini) are not supported yet — see [Roadmap](#roadmap).
+Linux, Windows, and other agents (Copilot, Gemini) are not supported yet — see [Roadmap](#roadmap).
 
 ### Where it works
 
-Every local surface shares one `~/.claude/settings.json`, so `agentwatch init`
-covers all of them at once.
-
-| Surface | Monitored | |
+| Agent / surface | Monitored | How |
 |---|---|---|
-| VS Code extension | Yes | verified — every transcript on this machine reports `claude-vscode`, and hooks execute |
-| Claude Code CLI | Yes | same binary, same config directory, same transcripts |
-| JetBrains extension | Expected | runs Claude Code locally against the same config |
-| Desktop app (macOS) | Expected | local process, same config directory |
-| Desktop app (Windows) | No | macOS only — Unix socket and launchd |
-| **Claude Code web** (claude.ai/code) | **No, and cannot** | the agent runs on Anthropic's infrastructure |
-| Cloud / remote sessions | No | same reason |
-| `claude` over SSH | The remote host | hooks and transcripts land there, not here |
+| Claude Code CLI | Yes | local hooks plus durable transcripts |
+| Claude Code for VS Code | Yes | the same local settings and transcripts; surface reported as `claude-vscode` |
+| Claude Code for JetBrains / macOS desktop | Expected | local Claude Code surfaces sharing `~/.claude/settings.json` |
+| Codex CLI | Yes | durable rollouts under `$CODEX_HOME/sessions` or `~/.codex/sessions` |
+| Codex IDE extension | Yes | the same local rollouts; surface reported by Codex, for example `codex_vscode` |
+| Claude Code web and other cloud sessions | No | no hook or durable session log is written to this Mac |
+| Agents run over SSH | On the remote host | AgentWatch must run where the agent writes its hooks or rollouts |
+| Windows | No | the collector currently uses a Unix socket and launchd |
 
-Hooks are read at session start, so a session already running when you install
-them stays unmonitored until you open a new one.
+Claude hooks are read at session start, so a Claude session already running
+when you install them remains unmonitored until you open a new one. Codex needs
+no hook configuration: the collector imports existing rollouts immediately and
+checks for additions every five minutes.
 
 ## Install
 
@@ -122,11 +138,11 @@ Then one command sets everything up:
 agentwatch init
 ```
 
-It registers the hooks, installs the collector as a LaunchAgent, starts the menu bar, and reads the history Claude Code has already written. It shows the whole plan — including the exact settings diff — and asks once before writing anything. `--dry-run` shows the plan and writes nothing; `--yes` skips the question; `--no-menu-bar` and `--no-import` leave those steps out.
+It registers Claude Code hooks, installs the collector as a LaunchAgent, starts the menu bar, and imports the history already written by Claude Code and Codex. It shows the whole plan — including the exact settings diff — and asks once before writing anything. `--dry-run` shows the plan and writes nothing; `--yes` skips the question; `--no-menu-bar` and `--no-import` leave those steps out.
 
 It is safe to re-run, and worth re-running after an upgrade: steps already done are reported as done, and a launchd job pointing at an older binary is re-pointed at the new one.
 
-Hooks are read at session start, so open a **new** agent session afterwards. An already-running session is not monitored.
+For Claude Code, open a **new** session afterwards so the hooks are loaded. Codex rollout collection requires no restart.
 
 Typing `agentwatch` on its own prints the version, whether it is collecting, and the commands worth knowing. `agentwatch --help` is the full list.
 
@@ -152,7 +168,7 @@ If you package it downstream anyway, that is your prerogative — but it is unsu
 
 ## Quick start
 
-`agentwatch init` already imported your history, so there is data to look at immediately — every transcript Claude Code has written, not just what has been collected since you installed:
+`agentwatch init` already imported your history, so there is data to look at immediately — Claude transcripts and Codex rollouts, not just work performed since installation:
 
 ```sh
 agentwatch tokens --all --by project       # where your tokens have gone, all time
@@ -183,6 +199,9 @@ Four counters are tracked separately — input, output, cache creation, and cach
 
 ```sh
 agentwatch sessions --days 7 --coverage             # counts, surface, and what was observed
+agentwatch sessions --agent claude,codex            # one unified session view
+agentwatch session latest                           # model, projects, counts, coverage
+agentwatch compare --by agent --days 30             # compare agent token usage
 agentwatch activity --days 1 --kind command,file.write
 agentwatch activity --days 7 --project ~/code/myrepo
 agentwatch security --days 7                        # access to sensitive paths
@@ -200,7 +219,7 @@ Event kinds for `--kind`: `session.started`, `session.ended`, `prompt`, `file.re
 agentwatch watch                                    # full-screen, ~500ms refresh
 ```
 
-`watch` is a separate surface on purpose. It owns the terminal, so it cannot be piped; every other command prints plain stdout so it can be.
+`watch` is a separate surface on purpose. It owns the terminal, so it cannot be piped; every other command prints plain stdout so it can be. The screen refreshes every ~500ms, but Codex data advances when its rollout reconciliation runs rather than on every redraw.
 
 ### Colour
 
@@ -213,6 +232,7 @@ State is never carried by colour alone: a running daemon is `● running` and a 
 ```sh
 agentwatch export --days 7 --kind command > commands.jsonl
 agentwatch export --days 30 | jq 'select(.kind == "mcp.call")'
+agentwatch import                                   # rescan Claude and Codex history safely
 agentwatch verify                                   # re-derive totals, report drift
 ```
 
@@ -274,51 +294,45 @@ The menu bar adds 367 KB and 3.8 ms. Merging everything *except* it costs 1.3 ms
 
 ### Which surface a session ran in
 
-`agentwatch sessions` shows a `surface` column carrying Claude Code's own
-`entrypoint` value — `claude-vscode` for the VS Code extension, and so on. It is
+`agentwatch sessions` shows agent, model, dominant repository, and a `surface`
+column carrying the source's own value — `claude-vscode` or `codex_vscode`, for example. It is
 stored verbatim rather than mapped onto an enum of ours, so a value we have
 never seen shows up as itself instead of collapsing into `Other`.
 
-Only transcripts carry the field, so a session seen purely through hooks reads
+Only durable logs carry the field, so a session seen purely through hooks reads
 as `?` until it is reconciled. That is *unknown*, not a default.
 
 ## What it records, and what it never records
 
 Never stored, by construction:
 
-- **Prompt text.** Only a character count and a SHA-256 digest, so repeated prompts can be recognized as repeats without anyone being able to read what they said.
+- **Prompt text.** Claude prompts become a character count and SHA-256 digest; Codex prompts are not deserialized.
 - **Tool output.** `tool_response` is never deserialized at all, so file contents and command output never reach a Rust value, let alone the database.
 - **File contents** from `Write` and `Edit` payloads.
 
-Shell command lines **are** recorded, because a command monitor that hides commands is pointless. That means a command containing a secret gets stored. Scrubbing for the obvious shapes is not implemented yet — see [Known limitations](#known-limitations).
+Shell command lines **are** recorded because they are part of the audit trail. Before storage, AgentWatch redacts common token, password, API-key, authorization-header, and URL-credential forms. This is a safety net, not a shell-language secret scanner; unusual or dynamically constructed secrets may still evade it.
 
 Nothing leaves your machine. There is no network client in the codebase.
 
 ## How it works
 
 ```
-claude code
-    │  SessionStart / UserPromptSubmit / PostToolUse / SessionEnd
-    ▼
-agentwatch hook           spawn → write one frame → exit
-    │
-    │  unix socket, u32-LE length prefix + JSON envelope
-    ▼
-daemon: ingest ──► mpsc(bounded) ──► normalize ──► batch ──► sqlite (WAL)
-                                          │
-                                     redaction
-                                          │
-                                    AgentEvent + EvidenceSource
+Claude Code hooks ──► unix socket ──┐
+                                    ├─► normalize ──► redact ──► SQLite (WAL)
+Codex rollout JSONL ─► reconcile ───┘          │
+                                          AgentEvent
+                                       + EvidenceSource
 ```
 
-The hook runs on every tool call, in the critical path of your own work, so the code it runs touches nothing that would slow its startup — no Tokio, no SQLite, no terminal. It opens the socket, writes one frame, and exits. Measured round trip: **~9ms** (n=150, release build; 7.7ms for 0.1's standalone binary — the difference is process spawn on a larger image, and is why [the menu bar stays separate](#why-the-menu-bar-is-its-own-binary)). **The hook exits 0 on every path**, including "daemon not running", malformed input, and oversized payloads. It cannot fail one of your tool calls.
+The Claude hook runs on every tool call, in the critical path of your own work, so the code it runs touches nothing that would slow its startup — no Tokio, no SQLite, no terminal. It opens the socket, writes one frame, and exits. Measured round trip: **~9ms** (n=150, release build; 7.7ms for 0.1's standalone binary — the difference is process spawn on a larger image, and is why [the menu bar stays separate](#why-the-menu-bar-is-its-own-binary)). **The hook exits 0 on every path**, including "daemon not running", malformed input, and oversized payloads. It cannot fail one of your tool calls. Codex does not spawn an AgentWatch hook; its durable rollout is reconciled out of band.
 
 | Crate | Does |
 |---|---|
 | `agentwatch-types` | Ids, timestamps, path resolution. No I/O. |
 | `agentwatch-events` | The normalized event schema, the adapter trait, the wire format. |
 | `agentwatch-storage` | SQLite: migrations, batch writes, queries. |
-| `agentwatch-adapter-claude` | Claude Code hook payloads → events. Redaction lives here. |
+| `agentwatch-adapter-claude` | Claude Code hook payloads and transcripts → events. |
+| `agentwatch-adapter-codex` | Codex rollout metadata → sessions, commands, file writes, models, and token usage. |
 | `agentwatch-daemon` | Socket server, pipeline, batching, reconciliation. Runs as `agentwatch daemon`. |
 | `agentwatch-hook` | The shim Claude Code spawns per tool call. Runs as `agentwatch hook`. |
 | `agentwatch-cli` | The `agentwatch` binary. Every command, and the two above. |
@@ -332,18 +346,19 @@ The crates stayed separate when the binaries merged: the hook still cannot reach
 
 These are design consequences, stated up front rather than discovered later.
 
-- **Anything the agent does inside a `Bash` command is invisible to the hooks.** `cat .env` is not a `Read`, so it produces no file event.
-- **The hook is configured through a file the monitored agent can edit.** Fine for analytics, disqualifying for anything claiming to be a security control.
+- **Anything Claude does inside a `Bash` command is opaque to its hooks.** `cat .env` is not a `Read`, so AgentWatch records the command and derives notable path references from it, but cannot claim a tool-observed file read.
+- **The Claude hook is configured through a file the monitored agent can edit.** Fine for analytics, disqualifying for anything claiming to be a security control.
 - **Sensitive paths are classified by name, never by reading them.** A credential in an ordinarily-named file is invisible. Reading files to find out would mean AgentWatch handling every secret on the machine, which is a worse position than the one it reports on.
 - **Command lines are scanned, not parsed.** `cat .env` is caught; `eval`, variable expansion, and heredocs are not. Anything recovered this way is labelled `derived` and never mixed in with tool-reported file events.
-- **Secrets inside command lines are stored unscrubbed.** Scrubbing for the obvious shapes is not implemented.
-- **Collection can be paused, and can be switched off entirely by editing the agent's settings.** Neither is prevented — nothing running as your own user could prevent it. Both are *recorded*: a pause writes `collection.paused`, and hooks disappearing from the settings file writes `config.changed`. A gap in the timeline should say why it is there rather than looking like an idle agent.
+- **Command redaction is intentionally conservative, not complete.** Common credential forms are removed before storage, but shell expansion, heredocs, unusual option names, and secrets embedded in arbitrary text can evade it.
+- **Collection can be paused, and Claude hook collection can be switched off by editing its settings.** Neither is prevented — nothing running as your own user could prevent it. Both are *recorded*: a pause writes `collection.paused`, and Claude hooks disappearing from the settings file writes `config.changed`. A gap in the timeline should say why it is there rather than looking like an idle agent.
 - **Claude Code web (claude.ai/code) is not monitored, and cannot be.** The agent runs on Anthropic's infrastructure, so there is no local process to hook, no local socket to reach, and no transcript written to your disk. The same applies to cloud and remote sessions. A quiet day in `agentwatch tokens` may only mean you worked in the browser.
 - **`claude` run over SSH monitors the remote machine, not yours.** Hooks and transcripts land on whichever host the agent runs on.
 - **Windows is not supported.** The daemon uses a Unix domain socket and the service uses launchd.
 - **Cost is not estimated.** On a subscription the per-token price is a number nobody pays, so tokens are the headline and cost stays opt-in until it can be labelled honestly.
 - **Attempted-but-denied tool calls are not recorded.** `PreToolUse` needs a real captured payload to confirm a pre-hook can be correlated to its post-hook; installing both without that would double every tool call's rows for no gain.
-- **Claude Code's transcript format is undocumented.** AgentWatch is pinned to it, and a format change will need a release. `agentwatch verify` is how you find out.
+- **Claude transcripts and Codex rollouts are undocumented formats.** Readers ignore unknown records and deserialize metadata selectively, but a breaking source-format change may need an AgentWatch release. `agentwatch verify` is the drift detector.
+- **Codex is near-live, not hook-live.** Rollouts are reconciled at collector startup and every five minutes. Claude hook events normally appear immediately.
 - **Retention is unbounded.** Nothing expires or vacuums yet.
 
 ## Roadmap
@@ -351,8 +366,7 @@ These are design consequences, stated up front rather than discovered later.
 ### Next — planned features
 
 - [ ] **`PreToolUse` correlation** — record what an agent *tried* to do and was denied, not only what completed. Blocked until a real session confirms a pre-hook can be correlated to its post-hook; installing both without that would double every tool call's rows.
-- [ ] **Secret scrubbing in command lines** — the one place AgentWatch can store something you did not intend to keep.
-- [ ] **A second agent adapter (Codex, Gemini)** — the adapter trait has existed since phase 1 for exactly this. Agent #2 is where the product starts; agent #1 proved the pipeline.
+- [ ] **A third agent adapter (Gemini)** — the adapter trait has existed since phase 1 for exactly this. Agent #2 is where the product starts; agent #1 proved the pipeline.
 - [ ] **Session diff and summary** — what changed in a repository over a session, from the file events already recorded.
 - [ ] **Alerting on sensitive access** — a notification when something reads a credential path, rather than finding it in `agentwatch security` a week later.
 
@@ -374,13 +388,13 @@ No. There is no network client in the codebase, and no telemetry, analytics, or 
 The one time anything leaves the machine is when you type `agentwatch update`, which shells out to `curl` to fetch a release archive from GitHub — a download, not an upload, and only on request. Keeping the transport out of the binary is deliberate: it is what makes the sentence above checkable with `grep`.
 
 **Will it slow down my agent?**
-The hook adds a measured ~9ms per tool call, and that cost is process spawn rather than anything AgentWatch computes — which is also why [the menu bar is a separate binary](#why-the-menu-bar-is-its-own-binary). It exits 0 on every path, so it cannot fail a tool call even when the daemon is down.
+For Claude Code, the hook adds a measured ~9ms per tool call, and that cost is process spawn rather than anything AgentWatch computes — which is also why [the menu bar is a separate binary](#why-the-menu-bar-is-its-own-binary). It exits 0 on every path, so it cannot fail a tool call even when the daemon is down. Codex uses no per-tool AgentWatch hook; rollout parsing happens in the collector.
 
 **Can it read my prompts or my code?**
-No. Prompts are reduced to a character count and a hash at the adapter boundary, and tool responses are never deserialized. Shell command lines are stored in full, deliberately.
+No. Claude prompts are reduced to a character count and hash, Codex prompts are skipped, and tool responses and patch bodies are never deserialized. Shell command lines are retained for the audit trail, with common token, password, API-key, authorization-header, and URL-credential forms redacted before storage.
 
 **Does it work with Cursor, Codex, Copilot, or Gemini?**
-Not yet. Claude Code only. The adapter trait exists so agent #2 is a week of work rather than a rewrite.
+Claude Code and Codex are supported. Copilot, Cursor, and Gemini do not have adapters yet.
 
 **Why doesn't it show me a dollar cost?**
 Because on a subscription the per-token price is a number nobody actually pays, and a confident wrong number is worse than no number.
