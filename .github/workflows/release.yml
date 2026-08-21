@@ -1,0 +1,203 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build, e.g. v0.1.0"
+        required: true
+
+# Releases must not race each other: two tags pushed together would otherwise
+# both try to create assets. In-progress runs are finished, never cancelled.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Nothing is published from a tree that does not pass its own checks. This
+  # duplicates CI on purpose: a tag can point at a commit CI never ran on.
+  check:
+    name: fmt, clippy, test
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets
+
+      - name: Doc tests
+        run: cargo test --doc
+
+      # A tag that disagrees with the version it ships is a support problem
+      # nobody can debug from the outside. Fail here instead.
+      - name: Tag matches the workspace version
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          version="$(sed -n '/^\[workspace\.package\]/,/^\[/ s/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          if [ "$tag" != "v$version" ]; then
+            echo "::error::tag $tag does not match workspace version $version (expected v$version)"
+            exit 1
+          fi
+          echo "tag $tag matches workspace version $version"
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built natively on each architecture rather than cross-compiled:
+          # rusqlite bundles SQLite as C, and a native build is one less thing
+          # that can be subtly wrong in a binary nobody can rebuild.
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-apple-darwin
+            runner: macos-13
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # default-members only, so the menu bar is deliberately not shipped in
+      # the archive. It is an opt-in build, documented as such in the README.
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Smoke test the binaries
+        run: |
+          set -euo pipefail
+          cd target/${{ matrix.target }}/release
+          ./agentwatch --version
+          ./agentwatch --help > /dev/null
+          # The hook must exit 0 even with no daemon listening. If that ever
+          # stops being true it fails a real tool call, so it is checked on
+          # the artifact itself, not only in the test suite.
+          if echo '{}' | ./agentwatch-hook; then
+            echo "hook exited 0 with no daemon listening"
+          else
+            echo "::error::agentwatch-hook exited non-zero with no daemon"
+            exit 1
+          fi
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          archive="agentwatch-${{ matrix.target }}.tar.gz"
+          # Binaries sit at the archive root, so `tar xz -C ~/.local/bin`
+          # puts them straight onto PATH with no stray directory.
+          tar -czf "$archive" \
+            -C target/${{ matrix.target }}/release \
+            agentwatch agentwatch-daemon agentwatch-hook
+          shasum -a 256 "$archive" > "$archive.sha256"
+          echo "--- $archive ---"
+          tar -tzf "$archive"
+          cat "$archive.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentwatch-${{ matrix.target }}
+          path: |
+            agentwatch-${{ matrix.target }}.tar.gz
+            agentwatch-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # One SHA256SUMS covering every archive, which is what install.sh
+      # verifies against before it puts anything on your PATH.
+      - name: Collect assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp artifacts/*.tar.gz dist/
+          cp install.sh dist/
+          cd dist
+          # sha256sum, not shasum: this job runs on Linux. The output format is
+          # the same one `shasum -a 256 -c` reads on the user's Mac.
+          sha256sum ./*.tar.gz install.sh > SHA256SUMS
+          ls -l
+          cat SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          notes="$(mktemp)"
+          cat > "$notes" <<NOTES
+          ## Install
+
+          \`\`\`sh
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/${TAG}/install.sh | sh
+          \`\`\`
+
+          Then:
+
+          \`\`\`sh
+          agentwatch install-hooks
+          agentwatch service install
+          \`\`\`
+
+          macOS only. The binaries are unsigned; \`curl\` does not set the
+          quarantine attribute, so they run as downloaded. Verify them against
+          \`SHA256SUMS\` if you would rather check by hand.
+          NOTES
+
+          # --verify-tag: never invent a tag that was not pushed.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --title "$TAG" \
+              --notes-file "$notes" \
+              --verify-tag
+          fi

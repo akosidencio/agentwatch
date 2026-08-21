@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+
+# A second push to the same branch cancels the first: nothing here is worth
+# paying for twice.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets
+
+      # Doc tests are not covered by --all-targets, and the crate docs carry
+      # the invariants worth keeping true.
+      - name: Doc tests
+        run: cargo test --doc
+
+  menubar:
+    name: menubar builds
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Excluded from default-members, so `cargo clippy --all-targets` above
+      # never sees it. Without this job it would rot unnoticed.
+      - name: Clippy
+        run: cargo clippy -p agentwatch-menubar --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build -p agentwatch-menubar

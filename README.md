@@ -91,7 +91,9 @@ curl -fsSL https://github.com/akosidencio/agentwatch/releases/latest/download/ag
   | tar xz -C ~/.local/bin
 ```
 
-The archive contains three binaries — `agentwatch`, `agentwatch-daemon`, and `agentwatch-hook` — and they must all land somewhere on your `PATH`.
+The archive contains three binaries — `agentwatch`, `agentwatch-daemon`, and `agentwatch-hook` — and they must all land somewhere on your `PATH`. Every release publishes a `SHA256SUMS` alongside them; the installer script verifies against it before writing anything, and you can check by hand with `shasum -a 256 -c SHA256SUMS`.
+
+The binaries are unsigned. `curl` does not set the quarantine attribute, so they run as downloaded — but if you fetch them through a browser instead, Gatekeeper will quarantine them and you will have to clear it yourself.
 
 Then wire it up:
 
@@ -324,6 +326,18 @@ Running the daemon in the foreground instead of as a service, for development:
 
 ```sh
 ./target/release/agentwatch-daemon
+```
+
+### Releasing
+
+`.github/workflows/ci.yml` runs fmt, clippy, and the tests on every push and pull request, plus a separate job that keeps the opt-in menu bar crate compiling.
+
+`.github/workflows/release.yml` is triggered by pushing a `v*` tag. It re-runs fmt, clippy, and the full test suite against the tagged commit — a tag can point at a commit CI never saw — checks that the tag matches the workspace version, then builds `aarch64-apple-darwin` and `x86_64-apple-darwin` natively on their own runners, smoke-tests the binaries, and publishes the archives, `SHA256SUMS`, and `install.sh` to the releases page.
+
+```sh
+# bump [workspace.package] version in Cargo.toml first; the tag must match
+git tag v0.1.0
+git push origin v0.1.0
 ```
 
 ## Uninstall
