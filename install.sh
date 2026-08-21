@@ -5,7 +5,7 @@
 #   curl -fsSL https://github.com/akosidencio/agentwatch/releases/latest/download/install.sh | sh
 #
 # Downloads the release archive for this machine, verifies it against the
-# published SHA256SUMS, and puts three binaries on your PATH. It does not touch
+# published SHA256SUMS, and puts four binaries on your PATH. It does not touch
 # your Claude Code settings and does not install a service: both are separate,
 # explicit commands that show you what they will do first.
 #
@@ -18,7 +18,7 @@ set -eu
 REPO="akosidencio/agentwatch"
 VERSION="${AGENTWATCH_VERSION:-latest}"
 BIN_DIR="${AGENTWATCH_BIN_DIR:-$HOME/.local/bin}"
-BINARIES="agentwatch agentwatch-daemon agentwatch-hook"
+BINARIES="agentwatch agentwatch-daemon agentwatch-hook agentwatch-menubar"
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }

@@ -20,12 +20,12 @@ use crossterm::event::{self, Event as TerminalEvent, KeyCode, KeyEventKind};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Row, Table};
+use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Row, Table};
 
 use crate::range;
-use crate::render;
+use crate::{render, theme};
 
 /// How often to re-read the database.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -126,6 +126,21 @@ fn snapshot(store: &Store, paths: &Paths) -> Result<Dashboard> {
     })
 }
 
+/// The chrome every panel shares.
+///
+/// Rounded, and in the border colour rather than the foreground: three boxes
+/// drawn at full contrast compete with the data inside them.
+fn panel(title: &str) -> Block<'_> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme::style(theme::FAINT))
+        .title(Line::styled(
+            format!(" {title} "),
+            theme::bold_style(theme::MUTED),
+        ))
+}
+
 /// Lays out and renders one frame.
 fn draw(frame: &mut ratatui::Frame<'_>, dashboard: &Dashboard) {
     let areas = Layout::default()
@@ -144,40 +159,44 @@ fn draw(frame: &mut ratatui::Frame<'_>, dashboard: &Dashboard) {
 
 /// The status line: daemon state, today's tokens, sensitive count.
 fn draw_header(frame: &mut ratatui::Frame<'_>, area: Rect, dashboard: &Dashboard) {
-    let (indicator, indicator_style) = if dashboard.daemon_running {
-        ("running", Style::default().fg(Color::Green))
+    let (dot, indicator, indicator_style) = if dashboard.daemon_running {
+        ("● ", "running", theme::style(theme::GOOD))
     } else {
         // Not an error: the view still works against stored history. But it
         // must be obvious, or an idle feed reads as an idle agent.
-        ("not running", Style::default().fg(Color::Yellow))
+        ("○ ", "not running", theme::style(theme::WARN))
     };
 
     let notable_style = if dashboard.notable > 0 {
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        theme::bold_style(theme::BAD)
     } else {
-        Style::default().fg(Color::DarkGray)
+        theme::style(theme::MUTED)
     };
 
+    // A dim label then its value, three times over. The separator is wide
+    // enough to group each pair without a divider character doing it.
+    fn label(text: &'static str) -> Span<'static> {
+        Span::styled(text, theme::style(theme::MUTED))
+    }
     let line = Line::from(vec![
-        Span::styled("daemon ", Style::default().fg(Color::DarkGray)),
+        Span::styled(dot, indicator_style),
         Span::styled(indicator, indicator_style),
-        Span::raw("   "),
-        Span::styled("tokens today ", Style::default().fg(Color::DarkGray)),
-        Span::raw(render::thousands(dashboard.totals.total())),
-        Span::raw("   "),
-        Span::styled("responses ", Style::default().fg(Color::DarkGray)),
+        Span::raw("    "),
+        label("tokens today "),
+        Span::styled(
+            render::thousands(dashboard.totals.total()),
+            theme::bold_style(theme::ACCENT),
+        ),
+        Span::raw("    "),
+        label("responses "),
         Span::raw(render::thousands(dashboard.totals.responses)),
-        Span::raw("   "),
-        Span::styled("sensitive ", Style::default().fg(Color::DarkGray)),
+        Span::raw("    "),
+        label("sensitive "),
         Span::styled(dashboard.notable.to_string(), notable_style),
     ]);
 
     frame.render_widget(
-        Paragraph::new(line).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" agentwatch — q to quit "),
-        ),
+        Paragraph::new(line).block(panel("agentwatch — q to quit")),
         area,
     );
 }
@@ -186,24 +205,52 @@ fn draw_header(frame: &mut ratatui::Frame<'_>, area: Rect, dashboard: &Dashboard
 fn draw_sessions(frame: &mut ratatui::Frame<'_>, area: Rect, dashboard: &Dashboard) {
     let home = std::env::var("HOME").ok();
 
+    let busiest = dashboard
+        .sessions
+        .iter()
+        .map(|session| session.tokens)
+        .max()
+        .unwrap_or(0);
+
     let rows = dashboard.sessions.iter().map(|session| {
         let style = match session.status.as_str() {
-            "active" => Style::default().fg(Color::Green),
-            "ended" => Style::default().fg(Color::DarkGray),
-            _ => Style::default().fg(Color::Yellow),
+            "active" => theme::style(theme::GOOD),
+            "ended" => theme::style(theme::MUTED),
+            _ => theme::style(theme::WARN),
+        };
+        // The share bar is against the busiest session, not the day's total: a
+        // bar that is 4% wide on every row ranks nothing.
+        let share = if busiest > 0 {
+            session.tokens as f64 / busiest as f64
+        } else {
+            0.0
         };
 
         Row::new(vec![
             session.id[..8.min(session.id.len())].to_owned(),
-            session.status.clone(),
-            render::thousands(session.tokens),
-            session.commands.to_string(),
-            session.files.to_string(),
-            if session.sensitive > 0 {
-                session.sensitive.to_string()
-            } else {
-                "-".to_owned()
-            },
+            format!(
+                "{} {}",
+                if session.status == "active" {
+                    "●"
+                } else {
+                    "○"
+                },
+                session.status
+            ),
+            // Right-aligned by padding: ratatui left-aligns every cell, and a
+            // ragged column of numbers cannot be compared down the page.
+            format!("{:>13}", render::thousands(session.tokens)),
+            format!("{:>4}", session.commands),
+            format!("{:>4}", session.files),
+            format!(
+                "{:>4}",
+                if session.sensitive > 0 {
+                    session.sensitive.to_string()
+                } else {
+                    "-".to_owned()
+                }
+            ),
+            theme::bar(share, 6),
             session.project.as_deref().map_or_else(String::new, |path| {
                 render::short_path(path, home.as_deref())
             }),
@@ -215,25 +262,29 @@ fn draw_sessions(frame: &mut ratatui::Frame<'_>, area: Rect, dashboard: &Dashboa
         rows,
         [
             Constraint::Length(9),
-            Constraint::Length(8),
+            Constraint::Length(10),
             Constraint::Length(14),
             Constraint::Length(5),
             Constraint::Length(5),
             Constraint::Length(5),
+            Constraint::Length(7),
             Constraint::Min(20),
         ],
     )
     .header(
         Row::new(vec![
-            "session", "status", "tokens", "cmd", "file", "sens", "project",
+            "session".to_owned(),
+            "status".to_owned(),
+            format!("{:>13}", "tokens"),
+            format!("{:>4}", "cmd"),
+            format!("{:>4}", "file"),
+            format!("{:>4}", "sens"),
+            "share".to_owned(),
+            "project".to_owned(),
         ])
-        .style(Style::default().fg(Color::DarkGray)),
+        .style(theme::bold_style(theme::MUTED)),
     )
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" sessions today "),
-    );
+    .block(panel("sessions today"));
 
     frame.render_widget(table, area);
 }
@@ -246,22 +297,34 @@ fn draw_feed(frame: &mut ratatui::Frame<'_>, area: Rect, dashboard: &Dashboard) 
     let items: Vec<ListItem<'_>> = dashboard.feed[start..]
         .iter()
         .map(|row| {
-            let style = match row.kind.as_str() {
-                "command" => Style::default().fg(Color::Cyan),
-                "file.write" => Style::default().fg(Color::Magenta),
-                "mcp.call" => Style::default().fg(Color::Blue),
-                "session.started" | "session.ended" => Style::default().fg(Color::Green),
-                "token.usage" => Style::default().fg(Color::DarkGray),
-                _ => Style::default(),
-            };
-            ListItem::new(Line::styled(render::event_line(row), style))
+            // Spans rather than one style for the whole line: the timestamp
+            // and the project are chrome on every row, and colouring them the
+            // same as the kind makes a busy feed unreadable.
+            let segments = render::event_segments(row);
+            let kind_style =
+                render::kind_colour(&segments.kind).map_or_else(Style::default, theme::style);
+
+            let mut spans = vec![
+                Span::styled(segments.time, theme::style(theme::MUTED)),
+                Span::raw("  "),
+                Span::styled(
+                    format!("{:<11}", segments.agent),
+                    theme::style(theme::MUTED),
+                ),
+                Span::raw("  "),
+                Span::styled(format!("{:<13}", segments.kind), kind_style),
+                Span::raw("  "),
+                Span::raw(segments.detail),
+            ];
+            if !segments.project.is_empty() {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(segments.project, theme::style(theme::MUTED)));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
-    frame.render_widget(
-        List::new(items).block(Block::default().borders(Borders::ALL).title(" activity ")),
-        area,
-    );
+    frame.render_widget(List::new(items).block(panel("activity")), area);
 }
 
 /// Takes over the terminal.
@@ -440,6 +503,44 @@ mod tests {
         assert!(
             !output.contains("step-0 "),
             "the oldest should have scrolled off"
+        );
+    }
+
+    #[test]
+    fn every_panel_carries_the_rounded_chrome() {
+        let output = render(&dashboard(true, 0));
+        // The corners are the visible half of the restyle. A panel that loses
+        // its block, or goes back to square borders, stops matching here.
+        assert_eq!(output.matches('\u{256d}').count(), 3, "{output}");
+        assert_eq!(output.matches('\u{256f}').count(), 3, "{output}");
+    }
+
+    #[test]
+    fn never_writes_an_escape_sequence_into_the_buffer() {
+        // Colour reaches the TUI as ratatui styles, never as text. A listing
+        // helper that painted its own string would land in the buffer as the
+        // literal escape characters and render as garbage.
+        let output = render(&dashboard(true, 0));
+        assert!(!output.contains('\u{1b}'), "{output:?}");
+    }
+
+    #[test]
+    fn liveness_reads_without_colour() {
+        // The dot, not just the hue, carries the state: the same frame has to
+        // be readable to someone who cannot distinguish the two colours.
+        assert!(render(&dashboard(true, 0)).contains("\u{25cf} running"));
+        assert!(render(&dashboard(false, 0)).contains("\u{25cb} not running"));
+    }
+
+    #[test]
+    fn the_busiest_session_sets_the_bar_scale() {
+        // One session is by definition the busiest, so its bar is full. Scaled
+        // against the day's total instead, a single session would read as a
+        // sliver on a dashboard where it is all of the traffic.
+        let output = render(&dashboard(true, 0));
+        assert!(
+            output.contains("\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}"),
+            "{output}"
         );
     }
 }

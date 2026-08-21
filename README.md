@@ -183,6 +183,12 @@ agentwatch watch                                    # full-screen, ~500ms refres
 
 `watch` is a separate surface on purpose. It owns the terminal, so it cannot be piped; every other command prints plain stdout so it can be.
 
+### Colour
+
+The listings are coloured when they are printed to a terminal and plain when they are not, so `agentwatch sessions | grep` sees exactly the bytes it always did — colour is a reading aid, never part of the output contract. Set `NO_COLOR=1` to turn it off in a terminal, or `CLICOLOR_FORCE=1` to keep it through a pipe into a pager that understands escape sequences.
+
+State is never carried by colour alone: a running daemon is `● running` and a stopped one is `○ not running`, so a stripped or colour-blind reading says the same thing.
+
 ### Export and verification
 
 ```sh
@@ -206,7 +212,13 @@ A pause takes effect within a fifth of a second, survives a daemon restart, and 
 
 ### Menu bar (optional)
 
-Live agent state, today's tokens, alert count, and a pause toggle in the macOS menu bar. It is built and shipped separately on purpose: `tray-icon` and `winit` add about 35 crates on macOS, which is not a cost to impose on people who only use the CLI.
+Live agent state, today's tokens, alert count, and a pause toggle in the macOS menu bar. `agentwatch-menubar` is in the release archive alongside the other binaries — it is optional to *run*, not to install:
+
+```sh
+agentwatch-menubar &
+```
+
+It is excluded from the workspace's default members so that building from source stays cheap — `tray-icon` and `winit` add about 35 crates on macOS. From a checkout, build it explicitly:
 
 ```sh
 cargo build -p agentwatch-menubar --release

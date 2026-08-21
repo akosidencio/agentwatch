@@ -4,6 +4,8 @@ use agentwatch_storage::{EventRow, Notable, SessionRow, TokenTotals};
 use agentwatch_types::Timestamp;
 pub(crate) use agentwatch_types::thousands;
 
+use crate::theme;
+
 /// What the sensitive-access listing cannot tell you.
 ///
 /// Printed with every security listing rather than buried in documentation: an
@@ -18,18 +20,21 @@ pub(crate) const SECURITY_CAVEAT: &str = concat!(
 
 /// Column header for a session listing.
 pub(crate) fn session_header() -> String {
-    format!(
-        "{:<8}  {:<16}  {:<9}  {:>13}  {:>4}  {:>4}  {:>4}  {:>4}  {:<13}  {}",
-        "session",
-        "started",
-        "duration",
-        "tokens",
-        "cmd",
-        "file",
-        "mcp",
-        "sens",
-        "surface",
-        "project"
+    theme::paint(
+        &format!(
+            "{:<8}  {:<16}  {:<9}  {:>13}  {:>4}  {:>4}  {:>4}  {:>4}  {:<13}  {}",
+            "session",
+            "started",
+            "duration",
+            "tokens",
+            "cmd",
+            "file",
+            "mcp",
+            "sens",
+            "surface",
+            "project"
+        ),
+        theme::MUTED,
     )
 }
 
@@ -63,9 +68,34 @@ pub(crate) fn session_line(row: &SessionRow) -> String {
     // so a session seen purely through hooks has none until it is reconciled.
     let surface = row.surface.as_deref().unwrap_or("?");
 
+    // Painted per column, not per line: the identity, the liveness, and the
+    // one number worth a second look each carry their own meaning, and a line
+    // in a single colour says only "this is a session".
+    let id = theme::paint(
+        &format!("{:<8}", &row.id[..8.min(row.id.len())]),
+        theme::ACCENT,
+    );
+    let duration = theme::paint(
+        &format!("{duration:<9}"),
+        if row.status == "active" {
+            theme::GOOD
+        } else {
+            theme::MUTED
+        },
+    );
+    let sensitive = theme::paint(
+        &format!("{sensitive:>4}"),
+        if row.sensitive > 0 {
+            theme::BAD
+        } else {
+            theme::MUTED
+        },
+    );
+    let surface = theme::paint(&format!("{surface:<13}"), theme::MUTED);
+    let started = theme::paint(&format!("{started:<16}"), theme::MUTED);
+
     format!(
-        "{:<8}  {started:<16}  {duration:<9}  {:>13}  {:>4}  {:>4}  {:>4}  {sensitive:>4}  {surface:<13}  {project}",
-        &row.id[..8.min(row.id.len())],
+        "{id}  {started}  {duration}  {:>13}  {:>4}  {:>4}  {:>4}  {sensitive}  {surface}  {project}",
         thousands(row.tokens),
         row.commands,
         row.files,
@@ -88,29 +118,50 @@ fn format_duration(milliseconds: i64) -> String {
 
 /// Column header for a sensitive-access listing.
 pub(crate) fn notable_header() -> String {
-    format!(
-        "{:<17}  {:<8}  {:<9}  {:<8}  {}",
-        "severity", "utc", "kind", "evidence", "path"
+    theme::paint(
+        &format!(
+            "{:<17}  {:<8}  {:<9}  {:<8}  {}",
+            "severity", "utc", "kind", "evidence", "path"
+        ),
+        theme::MUTED,
     )
 }
 
 /// One row of a sensitive-access listing.
 pub(crate) fn notable_line(row: &Notable) -> String {
     let home = std::env::var("HOME").ok();
+    // Severity is the column people scan, so it is the column that carries the
+    // colour. Unknown severities stay unpainted rather than being guessed at.
+    let severity_colour = match row.sensitivity.to_string().as_str() {
+        "critical" | "high" => theme::BAD,
+        "medium" => theme::WARN,
+        _ => theme::MUTED,
+    };
     format!(
-        "{:<17}  {:<8}  {:<9}  {:<8}  {}",
-        row.sensitivity,
-        clock_time(row.timestamp_us),
+        "{}  {}  {:<9}  {}  {}",
+        theme::paint(&format!("{:<17}", row.sensitivity), severity_colour),
+        theme::paint(
+            &format!("{:<8}", clock_time(row.timestamp_us)),
+            theme::MUTED
+        ),
         row.kind,
-        row.evidence,
+        theme::paint(&format!("{:<8}", row.evidence), theme::MUTED),
         short_path(&row.path, home.as_deref())
     )
 }
 
 /// The column header for a token breakdown.
 pub(crate) fn group_header(by: &str) -> String {
-    format!("{by:<34} {:>14} {:>7}", "tokens", "share")
+    // Trimmed before it is painted: trim_end on a painted string finds the
+    // reset sequence, not the spaces in front of it, and removes nothing.
+    theme::paint(
+        format!("{by:<34} {:>14} {:>7}", "tokens", "share").trim_end(),
+        theme::MUTED,
+    )
 }
+
+/// How wide the share bar is drawn, in columns.
+const SHARE_BAR: usize = 8;
 
 /// Formats one row of a token breakdown.
 pub(crate) fn group_line(label: &str, totals: &TokenTotals, overall: i64) -> String {
@@ -129,37 +180,110 @@ pub(crate) fn group_line(label: &str, totals: &TokenTotals, overall: i64) -> Str
         shown
     };
 
+    // The percentage stays: the bar is for ranking at a glance, and eight
+    // columns cannot distinguish 3% from 4% no matter how it is drawn.
     format!(
-        "{shown:<34} {:>14} {share:>6.1}%",
-        thousands(totals.total())
+        "{shown:<34} {:>14} {} {}",
+        thousands(totals.total()),
+        theme::paint(&format!("{share:>6.1}%"), theme::MUTED),
+        // Trimmed before painting for the same reason as the header: the bar
+        // pads to a fixed width for the TUI's columns, and a listing that is
+        // piped must not differ from one that is not.
+        theme::paint(
+            theme::bar(share / 100.0, SHARE_BAR).trim_end(),
+            theme::ACCENT
+        )
     )
+    .trim_end()
+    .to_owned()
 }
 
 /// The column header for a timeline listing.
 pub(crate) fn header() -> String {
-    format!(
-        "{:<8}  {:<11}  {:<13}  {}",
-        "utc", "agent", "event", "detail"
+    theme::paint(
+        &format!(
+            "{:<8}  {:<11}  {:<13}  {}",
+            "utc", "agent", "event", "detail"
+        ),
+        theme::MUTED,
     )
 }
 
-/// Formats one event as a timeline line.
-pub(crate) fn event_line(row: &EventRow) -> String {
-    let time = clock_time(row.timestamp_us);
-    let detail = detail(&row.kind, &row.payload);
-    let home = std::env::var("HOME").ok();
-    let project = row
-        .project_path
-        .as_deref()
-        .map(|path| short_path(path, home.as_deref()))
-        .unwrap_or_default();
+/// The palette entry for one event kind.
+///
+/// Shared with the TUI's activity list so the same event is the same colour in
+/// both surfaces. An unrecognised kind is deliberately left unpainted.
+pub(crate) const fn kind_colour(kind: &str) -> Option<u8> {
+    match kind.as_bytes() {
+        b"command" => Some(theme::ACCENT),
+        b"file.write" => Some(theme::VIOLET),
+        b"mcp.call" => Some(theme::TEAL),
+        b"session.started" | b"session.ended" => Some(theme::GOOD),
+        b"config.changed" => Some(theme::BAD),
+        b"token.usage" | b"file.read" => Some(theme::MUTED),
+        _ => None,
+    }
+}
+
+/// One event as a timeline line, coloured for a terminal.
+///
+/// The TUI does not go through here: it builds spans from [`event_segments`]
+/// directly, because a ratatui buffer draws escape sequences as the literal
+/// characters they are instead of interpreting them.
+pub(crate) fn event_line_painted(row: &EventRow) -> String {
+    let segments = event_segments(row);
+    let kind = format!("{:<13}", segments.kind);
 
     format!(
-        "{time}  {:<11}  {:<13}  {detail}  {project}",
-        row.agent_id, row.kind
+        "{}  {}  {}  {}  {}",
+        theme::paint(&segments.time, theme::MUTED),
+        theme::paint(&format!("{:<11}", segments.agent), theme::MUTED),
+        kind_colour(&segments.kind)
+            .map_or_else(|| kind.clone(), |colour| theme::paint(&kind, colour)),
+        segments.detail,
+        // Painted only when there is something to paint: an escape pair around
+        // an empty string survives trim_end and leaves codes on a bare line.
+        if segments.project.is_empty() {
+            String::new()
+        } else {
+            theme::paint(&segments.project, theme::MUTED)
+        }
     )
     .trim_end()
     .to_owned()
+}
+
+/// The fields a timeline line is built from.
+///
+/// Exists so the plain form, the painted form, and the TUI's spans all agree
+/// on what a row says without any of them re-deriving it.
+pub(crate) struct EventSegments {
+    /// Local wall-clock time.
+    pub(crate) time: String,
+    /// Which agent produced the event.
+    pub(crate) agent: String,
+    /// The event kind, verbatim.
+    pub(crate) kind: String,
+    /// The one interesting field, if this build knows how to summarize it.
+    pub(crate) detail: String,
+    /// The project path, shortened, or empty.
+    pub(crate) project: String,
+}
+
+/// Breaks an event into its display fields.
+pub(crate) fn event_segments(row: &EventRow) -> EventSegments {
+    let home = std::env::var("HOME").ok();
+    EventSegments {
+        time: clock_time(row.timestamp_us),
+        agent: row.agent_id.clone(),
+        kind: row.kind.clone(),
+        detail: detail(&row.kind, &row.payload),
+        project: row
+            .project_path
+            .as_deref()
+            .map(|path| short_path(path, home.as_deref()))
+            .unwrap_or_default(),
+    }
 }
 
 /// Renders a timestamp as local wall-clock time.
@@ -246,6 +370,19 @@ pub(crate) fn short_path(path: &str, home: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A row's fields joined without colour.
+    ///
+    /// These cases assert on what a timeline line *says* — including that an
+    /// unsummarizable payload still leaves the kind visible — so they need the
+    /// whole line, not just the detail field.
+    fn event_text(row: &EventRow) -> String {
+        let segments = event_segments(row);
+        format!(
+            "{}  {}  {}  {}  {}",
+            segments.time, segments.agent, segments.kind, segments.detail, segments.project
+        )
+    }
 
     fn row(kind: &str, payload: &str) -> EventRow {
         EventRow {
@@ -450,7 +587,7 @@ mod tests {
 
     #[test]
     fn shows_the_path_for_a_file_event() {
-        let line = event_line(&row(
+        let line = event_text(&row(
             "file.read",
             r#"{"kind":"file.read","path":"/src/a.rs"}"#,
         ));
@@ -460,7 +597,7 @@ mod tests {
 
     #[test]
     fn shows_the_command_for_a_command_event() {
-        let line = event_line(&row(
+        let line = event_text(&row(
             "command",
             r#"{"kind":"command","command":"cargo test"}"#,
         ));
@@ -469,7 +606,7 @@ mod tests {
 
     #[test]
     fn joins_server_and_tool_for_an_mcp_call() {
-        let line = event_line(&row(
+        let line = event_text(&row(
             "mcp.call",
             r#"{"kind":"mcp.call","server":"github","tool":"get_issue"}"#,
         ));
@@ -478,13 +615,13 @@ mod tests {
 
     #[test]
     fn shows_a_character_count_for_a_prompt_and_never_text() {
-        let line = event_line(&row("prompt", r#"{"kind":"prompt","char_count":42}"#));
+        let line = event_text(&row("prompt", r#"{"kind":"prompt","char_count":42}"#));
         assert!(line.contains("42 chars"), "{line}");
     }
 
     #[test]
     fn survives_a_payload_it_cannot_parse() {
-        let line = event_line(&row("command", "not json"));
+        let line = event_text(&row("command", "not json"));
         assert!(line.contains("command"), "{line}");
     }
 

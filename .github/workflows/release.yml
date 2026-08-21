@@ -93,10 +93,14 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # default-members only, so the menu bar is deliberately not shipped in
-      # the archive. It is an opt-in build, documented as such in the README.
+      # The menu bar is out of default-members so that a `cargo build` from
+      # source stays cheap, but it ships in the archive: a release user has no
+      # Rust toolchain, and "go compile it yourself" is not an install story.
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target ${{ matrix.target }}
+          cargo build --release --locked --target ${{ matrix.target }} -p agentwatch-menubar
 
       - name: Smoke test the binaries
         run: |
@@ -113,6 +117,10 @@ jobs:
             echo "::error::agentwatch-hook exited non-zero with no daemon"
             exit 1
           fi
+          # The menu bar takes no flags and blocks in an event loop, so it is
+          # checked for existence and architecture rather than run.
+          test -x ./agentwatch-menubar
+          file ./agentwatch-menubar
 
       - name: Package
         run: |
@@ -122,7 +130,7 @@ jobs:
           # puts them straight onto PATH with no stray directory.
           tar -czf "$archive" \
             -C target/${{ matrix.target }}/release \
-            agentwatch agentwatch-daemon agentwatch-hook
+            agentwatch agentwatch-daemon agentwatch-hook agentwatch-menubar
           shasum -a 256 "$archive" > "$archive.sha256"
           echo "--- $archive ---"
           tar -tzf "$archive"

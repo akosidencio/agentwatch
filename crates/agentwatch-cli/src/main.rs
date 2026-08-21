@@ -11,6 +11,7 @@ mod range;
 mod render;
 mod service;
 mod sync;
+mod theme;
 mod watch;
 
 use std::path::PathBuf;
@@ -269,15 +270,31 @@ fn status(paths: &Paths) -> Result<()> {
     let socket = paths.socket();
     let running = std::os::unix::net::UnixStream::connect(&socket).is_ok();
 
+    // A filled dot for running, hollow for not: the shape carries the state on
+    // its own, so the line still reads correctly with colour stripped.
+    let (dot, word, colour) = if running {
+        ("●", "running", theme::GOOD)
+    } else {
+        ("○", "not running", theme::WARN)
+    };
+    let label = |text: &str| theme::paint(&format!("{text:<8}"), theme::MUTED);
+
     println!(
-        "daemon    {}",
-        if running { "running" } else { "not running" }
+        "{}  {}",
+        label("daemon"),
+        theme::paint(&format!("{dot} {word}"), colour)
     );
-    println!("socket    {}", socket.display());
+    println!("{}  {}", label("socket"), socket.display());
     if paths.is_paused() {
-        println!("collection PAUSED — run `agentwatch resume` to record again");
+        println!(
+            "{}",
+            theme::paint(
+                "collection PAUSED — run `agentwatch resume` to record again",
+                theme::BAD
+            )
+        );
     }
-    println!("database  {}", paths.database().display());
+    println!("{}  {}", label("database"), paths.database().display());
 
     if !paths.database().exists() {
         println!("\nNo database yet. Start the daemon with `agentwatch-daemon`.");
@@ -288,10 +305,16 @@ fn status(paths: &Paths) -> Result<()> {
     let totals = store.totals().context("reading totals")?;
 
     println!();
-    println!("events            {}", totals.events);
-    println!("sessions          {}", totals.sessions);
-    println!("active sessions   {}", totals.active_sessions);
-    println!("projects          {}", totals.projects);
+    let counter = |label: &str, value: i64| {
+        println!(
+            "{}  {value}",
+            theme::paint(&format!("{label:<16}"), theme::MUTED)
+        );
+    };
+    counter("events", totals.events);
+    counter("sessions", totals.sessions);
+    counter("active sessions", totals.active_sessions);
+    counter("projects", totals.projects);
 
     Ok(())
 }
@@ -320,7 +343,7 @@ fn tokens(
         .token_totals(range.from_us, range.to_us)
         .context("reading totals")?;
 
-    println!("Token usage — {}", range.label);
+    println!("{}", theme::bold(&format!("Token usage — {}", range.label)));
     if !offset_is_local {
         println!("(times in UTC: the local timezone could not be determined)");
     }
@@ -380,22 +403,29 @@ const fn by_label(by: Grouping) -> &'static str {
 
 /// Prints the four counters and their sum.
 fn print_totals(totals: &TokenTotals) {
-    println!("  input          {:>15}", render::thousands(totals.input));
+    // The label is chrome and the number is the answer, so only the label is
+    // dimmed. The total is the one line people came for, so only it is bold.
+    let counter = |label: &str, value: i64| {
+        println!(
+            "  {}  {:>15}",
+            theme::paint(&format!("{label:<13}"), theme::MUTED),
+            render::thousands(value)
+        );
+    };
+
+    counter("input", totals.input);
+    counter("cache write", totals.cache_creation);
+    counter("cache read", totals.cache_read);
+    counter("output", totals.output);
+    println!("  {}", theme::rule(30));
     println!(
-        "  cache write    {:>15}",
-        render::thousands(totals.cache_creation)
+        "  {}  {}",
+        theme::paint(&format!("{:<13}", "total"), theme::MUTED),
+        // Padded before it is bolded: widening a string that already carries
+        // escape sequences counts those bytes and shortens the column.
+        theme::bold(&format!("{:>15}", render::thousands(totals.total())))
     );
-    println!(
-        "  cache read     {:>15}",
-        render::thousands(totals.cache_read)
-    );
-    println!("  output         {:>15}", render::thousands(totals.output));
-    println!("  {:-<30}", "");
-    println!("  total          {:>15}", render::thousands(totals.total()));
-    println!(
-        "  responses      {:>15}",
-        render::thousands(totals.responses)
-    );
+    counter("responses", totals.responses);
 }
 
 /// Pauses or resumes collection.
@@ -729,7 +759,7 @@ fn activity(paths: &Paths, days: u32, limit: u32, filter: ActivityFilter) -> Res
     println!();
     println!("{}", render::header());
     for row in &rows {
-        println!("{}", render::event_line(row));
+        println!("{}", render::event_line_painted(row));
     }
     Ok(())
 }
@@ -905,7 +935,7 @@ fn events(paths: &Paths, limit: u32) -> Result<()> {
     // shows the wrong hour is worse than one that says which hour it means.
     println!("{}", render::header());
     for row in rows.iter().rev() {
-        println!("{}", render::event_line(row));
+        println!("{}", render::event_line_painted(row));
     }
 
     Ok(())
