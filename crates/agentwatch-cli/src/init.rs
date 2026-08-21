@@ -37,9 +37,6 @@ pub(crate) struct Options {
     pub(crate) import: bool,
 }
 
-/// Width the step labels are padded to, so the column lines up.
-const LABEL: usize = 12;
-
 /// What a step would do, once we have looked at the machine.
 enum Action {
     /// Write these settings, whose diff against the current file is `diff`.
@@ -100,7 +97,7 @@ pub(crate) fn run(paths: &Paths, options: Options) -> Result<()> {
     let settings_path = install::file::default_settings_path();
     let steps = plan(paths, &settings_path, options)?;
 
-    heading("AgentWatch setup");
+    theme::heading("AgentWatch setup");
     let field = |name: &str| theme::paint(&format!("{name:<16}"), theme::MUTED);
     println!("  {}{}", field("binaries"), binary_directory().display());
     println!("  {}{}", field("settings file"), settings_path.display());
@@ -135,7 +132,7 @@ pub(crate) fn run(paths: &Paths, options: Options) -> Result<()> {
         return Ok(());
     }
 
-    heading("Setting up");
+    theme::heading("Setting up");
 
     let mut failures = Vec::new();
     for step in &steps {
@@ -148,7 +145,7 @@ pub(crate) fn run(paths: &Paths, options: Options) -> Result<()> {
             println!(
                 "  {}{}{}",
                 theme::paint("· ", theme::FAINT),
-                label(step.label),
+                theme::label(step.label),
                 theme::paint("skipped while something above is unresolved", theme::WARN)
             );
             continue;
@@ -157,14 +154,14 @@ pub(crate) fn run(paths: &Paths, options: Options) -> Result<()> {
             Ok(note) => println!(
                 "  {}{}{}",
                 theme::paint("✓ ", theme::GOOD),
-                label(step.label),
+                theme::label(step.label),
                 theme::paint(&note, theme::MUTED)
             ),
             Err(error) => {
                 println!(
                     "  {}{}{}",
                     theme::paint("✗ ", theme::BAD),
-                    label(step.label),
+                    theme::label(step.label),
                     theme::paint(&format!("{error:#}"), theme::BAD)
                 );
                 failures.push(format!("{:<9} `{}`", step.label, step.retry));
@@ -332,7 +329,7 @@ fn job_step(
 
 /// Prints the plan, numbering only the steps that would do something.
 fn print_plan(steps: &[Step]) {
-    heading("Plan");
+    theme::heading("Plan");
 
     let mut number = 0;
     for step in steps {
@@ -352,12 +349,12 @@ fn print_plan(steps: &[Step]) {
             Action::Unavailable(reason) => theme::paint(reason, theme::WARN),
             _ => step.what.clone(),
         };
-        println!("  {marker}{}{detail}", label(step.label));
+        println!("  {marker}{}{detail}", theme::label(step.label));
     }
 
     for step in steps {
         if let Action::Hooks { path, diff, .. } = &step.action {
-            heading(&format!("Change to {}", path.display()));
+            theme::heading(&format!("Change to {}", path.display()));
             print!("{diff}");
         }
     }
@@ -446,14 +443,18 @@ fn report(paths: &Paths, failures: &[String]) {
     };
     println!(
         "  {}{}",
-        label("collector"),
+        theme::label("collector"),
         theme::paint(&format!("{dot} {word}"), colour)
     );
 
     if let Ok(store) = Store::open_read_only(paths.database())
         && let Ok(totals) = store.totals()
     {
-        println!("  {}{}", label("events"), render::thousands(totals.events));
+        println!(
+            "  {}{}",
+            theme::label("events"),
+            render::thousands(totals.events)
+        );
     }
 
     if !failures.is_empty() {
@@ -557,25 +558,6 @@ fn path_warning() -> Option<String> {
         return None;
     }
     Some(directory.to_owned())
-}
-
-/// Prints a section heading.
-///
-/// The rule is what makes this read as a section in a wall of output. Drawn to
-/// the heading's own width rather than the terminal's, so it frames the title
-/// instead of cutting the screen in half.
-fn heading(title: &str) {
-    println!();
-    println!("  {}", theme::bold(title));
-    println!(
-        "  {}",
-        theme::paint(&"─".repeat(title.chars().count()), theme::FAINT)
-    );
-}
-
-/// Pads a step label to the shared column width.
-fn label(text: &str) -> String {
-    theme::paint(&format!("{text:<LABEL$}"), theme::MUTED)
 }
 
 #[cfg(test)]

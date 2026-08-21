@@ -91,6 +91,25 @@ fn bold_when(text: &str, enabled: bool) -> String {
     format!("\x1b[1m{text}\x1b[0m")
 }
 
+/// Width the step labels in `init` and `uninstall` are padded to.
+pub(crate) const LABEL: usize = 12;
+
+/// Prints a section heading.
+///
+/// The rule is what makes this read as a section in a wall of output. Drawn to
+/// the heading's own width rather than the terminal's, so it frames the title
+/// instead of cutting the screen in half.
+pub(crate) fn heading(title: &str) {
+    println!();
+    println!("  {}", bold(title));
+    println!("  {}", rule(title.chars().count()));
+}
+
+/// Pads a step label to the shared column width, then colours it.
+pub(crate) fn label(text: &str) -> String {
+    paint(&format!("{text:<LABEL$}"), MUTED)
+}
+
 /// A horizontal rule, in the border colour.
 pub(crate) fn rule(width: usize) -> String {
     paint(&"─".repeat(width), FAINT)

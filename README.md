@@ -335,34 +335,6 @@ These are design consequences, stated up front rather than discovered later.
 
 ## Roadmap
 
-### Shipped — v0.1.1
-
-Same feature set, one front door.
-
-- [x] **`agentwatch init`** — one command for hooks, the collector, the menu bar, and history. Shows the whole plan, asks once, safe to re-run.
-- [x] **One executable** — the CLI, the collector, and the hook are `agentwatch`, `agentwatch daemon`, and `agentwatch hook`. Four binaries became two; [the menu bar stays separate for a measured reason](#why-the-menu-bar-is-its-own-binary).
-- [x] **Safe upgrades** — hook entries written by 0.1 are recognised and repointed, never duplicated, and the binaries they pointed at are removed only after the launchd job has been rewritten.
-- [x] **`PATH` handled by the installer** — the warning it used to print scrolled past in a `curl | sh` pipe.
-- [x] **A welcome screen** — a bare `agentwatch` says what it is, whether it is collecting, and what to type next, instead of a usage error.
-
-### Shipped — v0.1.0
-
-Claude Code on macOS, local only. 304 tests, clippy clean.
-
-- [x] **Hook → daemon → SQLite pipeline** — ~7ms median per tool call, exits 0 on every path
-- [x] **Exact token accounting** — deduplicated by `message.id`, 0 drift across 149 transcripts
-- [x] **Full history import** — `agentwatch import`, idempotent
-- [x] **Repository rollup** — 170 working directories resolved to 39 repositories
-- [x] **CLI** — `tokens`, `sessions`, `activity`, `security`, `events`, `export`, `status`
-- [x] **Live TUI** — `agentwatch watch`
-- [x] **macOS menu bar** — agent state, today's tokens, alert count, pause toggle
-- [x] **Safe installation** — `install-hooks` and `service install`, both diff-then-ask
-- [x] **Sensitive path classification** — at ingest, hook-observed and command-derived kept apart
-- [x] **Tamper and pause records** — `config.changed`, `collection.paused` / `collection.resumed`
-- [x] **JSON Lines export** — everything the CLI does not print
-- [x] **Drift verification** — `agentwatch verify`
-- [x] **Signed-off release pipeline** — tag-triggered, gated on fmt, clippy, and the full test suite; publishes both macOS architectures with checksums
-
 ### Next — planned features
 
 - [ ] **`PreToolUse` correlation** — record what an agent *tried* to do and was denied, not only what completed. Blocked until a real session confirms a pre-hook can be correlated to its post-hook; installing both without that would double every tool call's rows.
@@ -425,15 +397,33 @@ agentwatch init
 
 ## Uninstall
 
+One command, the mirror image of [`init`](#install):
+
+```sh
+agentwatch uninstall
+```
+
+It removes the hooks, stops and deletes both launchd jobs, takes the installer's line back out of your shell profile, and deletes the executables — showing the whole plan, including the settings diff, and asking once.
+
+**Your collected data is kept unless you ask for it to go.** Binaries can be downloaded again; months of history cannot. Re-installing picks up where it left off.
+
+```sh
+agentwatch uninstall --dry-run         # show what would be removed, remove nothing
+agentwatch uninstall --purge           # also delete the database and everything in it
+agentwatch uninstall --keep-binaries   # unhook everything, leave the executables
+```
+
+The hook removal takes out exactly what was added — including entries written by 0.1 — and leaves any other tool's hooks untouched. The shell profile edit is equally narrow: only a block carrying the installer's `# added by the AgentWatch installer` marker is touched, and only the one line under it.
+
+It removes the binary it is *running from*, the same way `init` wires up the binary it is running from, so run the installed copy rather than one in a build tree. The plan names the directory before you agree to it.
+
+The individual commands still exist, if you would rather do it a piece at a time:
+
 ```sh
 agentwatch install-hooks --uninstall
 agentwatch service uninstall
 agentwatch service uninstall --menu-bar
-rm -rf ~/.agentwatch          # deletes collected data
-rm ~/.local/bin/agentwatch ~/.local/bin/agentwatch-menubar
 ```
-
-The hook uninstall removes exactly what was added — including entries written by 0.1 — and leaves any other tool's hooks untouched. If the installer added a `PATH` line to your shell profile, it is marked `# added by the AgentWatch installer`.
 
 ## License
 

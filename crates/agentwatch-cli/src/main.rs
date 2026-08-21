@@ -13,6 +13,7 @@ mod render;
 mod service;
 mod sync;
 mod theme;
+mod uninstall;
 mod watch;
 mod welcome;
 
@@ -101,6 +102,25 @@ enum Command {
         /// Skip reading the history Claude Code has already written.
         #[arg(long)]
         no_import: bool,
+    },
+    /// Take AgentWatch back off this machine.
+    ///
+    /// The counterpart to `init`: hooks, both launchd jobs, the installer's
+    /// PATH line, and the executables. Collected data is kept unless `--purge`
+    /// says otherwise. Shows the whole plan and asks once.
+    Uninstall {
+        /// Show the plan and exit without removing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Remove without asking.
+        #[arg(long, short)]
+        yes: bool,
+        /// Also delete the database and everything collected in it.
+        #[arg(long)]
+        purge: bool,
+        /// Leave the executables in place.
+        #[arg(long)]
+        keep_binaries: bool,
     },
     /// Show whether the daemon is running and what it has collected.
     Status,
@@ -284,6 +304,20 @@ fn main() -> Result<()> {
                 dry_run,
                 menu_bar: !no_menu_bar,
                 import: !no_import,
+            },
+        ),
+        Command::Uninstall {
+            dry_run,
+            yes,
+            purge,
+            keep_binaries,
+        } => uninstall::run(
+            &paths,
+            uninstall::Options {
+                assume_yes: yes,
+                dry_run,
+                purge,
+                keep_binaries,
             },
         ),
         Command::Status => status(&paths),
