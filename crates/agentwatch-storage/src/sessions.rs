@@ -215,10 +215,20 @@ impl Store {
             sql.push_str(&format!(" AND e.session_id = ?{}", bindings.len()));
         }
         if let Some(prefix) = &filter.project_prefix {
-            bindings.push(Box::new(format!("{prefix}%")));
-            let index = bindings.len();
+            let prefix = if prefix == "/" {
+                prefix.clone()
+            } else {
+                prefix.trim_end_matches('/').to_owned()
+            };
+            bindings.push(Box::new(prefix.clone()));
+            let exact = bindings.len();
+            bindings.push(Box::new(descendant_pattern(&prefix)));
+            let descendant = bindings.len();
             sql.push_str(&format!(
-                " AND (COALESCE(r.root, p.path) LIKE ?{index} OR p.path LIKE ?{index})"
+                " AND (COALESCE(r.root, p.path) = ?{exact}
+                        OR COALESCE(r.root, p.path) LIKE ?{descendant} ESCAPE '\\'
+                        OR p.path = ?{exact}
+                        OR p.path LIKE ?{descendant} ESCAPE '\\')"
             ));
         }
         if !filter.kinds.is_empty() {
@@ -251,6 +261,22 @@ impl Store {
         events.reverse();
         Ok(events)
     }
+}
+
+/// A literal SQL `LIKE` pattern matching descendants of one filesystem path.
+fn descendant_pattern(prefix: &str) -> String {
+    let mut escaped = String::with_capacity(prefix.len() + 3);
+    for character in prefix.chars() {
+        if matches!(character, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    if prefix != "/" {
+        escaped.push('/');
+    }
+    escaped.push('%');
+    escaped
 }
 
 /// Reads a joined event row.
@@ -404,6 +430,70 @@ mod tests {
                 .expect("activity")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn project_filter_respects_path_boundaries_and_literal_wildcards() {
+        let mut store = Store::open_in_memory().expect("schema");
+        let event = |session: &str, project: &str, micros: i64| {
+            AgentEvent::observed(
+                AgentId::CLAUDE_CODE,
+                EvidenceSource::Hook,
+                Event::Command(CommandEvent {
+                    command: "pwd".to_owned(),
+                    description: None,
+                }),
+            )
+            .with_session(ExternalSessionId::from(session.to_owned()))
+            .with_project_path(project.to_owned())
+            .at(Timestamp::from_micros(micros))
+        };
+        store
+            .insert_events(&[
+                event("exact", "/work/app_1", 1),
+                event("child", "/work/app_1/crate", 2),
+                event("underscore-wildcard", "/work/appA1", 3),
+                event("sibling-prefix", "/work/app_10", 4),
+                event("percent-exact", "/work/app%1", 5),
+                event("percent-child", "/work/app%1/crate", 6),
+                event("percent-wildcard", "/work/appX1", 7),
+            ])
+            .expect("insert");
+
+        let rows = store
+            .activity(
+                0,
+                i64::MAX,
+                &ActivityFilter {
+                    project_prefix: Some("/work/app_1".to_owned()),
+                    ..ActivityFilter::default()
+                },
+                100,
+            )
+            .expect("activity");
+
+        let projects: Vec<_> = rows
+            .iter()
+            .filter_map(|row| row.project_path.as_deref())
+            .collect();
+        assert_eq!(projects, ["/work/app_1", "/work/app_1/crate"]);
+
+        let rows = store
+            .activity(
+                0,
+                i64::MAX,
+                &ActivityFilter {
+                    project_prefix: Some("/work/app%1".to_owned()),
+                    ..ActivityFilter::default()
+                },
+                100,
+            )
+            .expect("activity");
+        let projects: Vec<_> = rows
+            .iter()
+            .filter_map(|row| row.project_path.as_deref())
+            .collect();
+        assert_eq!(projects, ["/work/app%1", "/work/app%1/crate"]);
     }
 
     #[test]

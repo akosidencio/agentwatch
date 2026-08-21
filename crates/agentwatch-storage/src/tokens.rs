@@ -1,5 +1,7 @@
 //! Token analytics and the reconcile bookkeeping that feeds it.
 
+use std::collections::BTreeMap;
+
 use rusqlite::params;
 
 use crate::store::{Store, StoreError};
@@ -173,11 +175,11 @@ impl Store {
         )
     }
 
-    /// Breaks token usage down by day, in the given timezone offset.
+    /// Breaks token usage down by day using the caller's timezone resolver.
     ///
-    /// `offset_seconds` shifts UTC into the user's zone before the date is
-    /// taken, so a day boundary lands where the user thinks it does rather than
-    /// wherever UTC happens to put it.
+    /// The callback receives each row's UTC timestamp. Resolving per row rather
+    /// than applying one fixed offset is what keeps historical data correct in
+    /// zones whose UTC offset changes for daylight saving time.
     ///
     /// # Errors
     ///
@@ -186,27 +188,42 @@ impl Store {
         &self,
         from_us: i64,
         to_us: i64,
-        offset_seconds: i64,
+        mut day_for: impl FnMut(i64) -> String,
     ) -> Result<Vec<TokenGroup>, StoreError> {
         let mut statement = self.connection().prepare(
-            "SELECT date((timestamp_us / 1000000) + ?3, 'unixepoch'),
-                    COALESCE(SUM(input_tokens), 0),
-                    COALESCE(SUM(cache_creation_input_tokens), 0),
-                    COALESCE(SUM(cache_read_input_tokens), 0),
-                    COALESCE(SUM(output_tokens), 0),
-                    COUNT(*)
+            "SELECT timestamp_us, input_tokens, cache_creation_input_tokens,
+                    cache_read_input_tokens, output_tokens
                FROM token_usage
               WHERE timestamp_us >= ?1 AND timestamp_us < ?2
-              GROUP BY 1
-              ORDER BY 1",
+              ORDER BY timestamp_us",
         )?;
 
-        let rows = statement.query_map(params![from_us, to_us, offset_seconds], read_group)?;
-        let mut groups = Vec::new();
+        let rows = statement.query_map(params![from_us, to_us], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                TokenTotals {
+                    input: row.get(1)?,
+                    cache_creation: row.get(2)?,
+                    cache_read: row.get(3)?,
+                    output: row.get(4)?,
+                    responses: 1,
+                },
+            ))
+        })?;
+        let mut by_day: BTreeMap<String, TokenTotals> = BTreeMap::new();
         for row in rows {
-            groups.push(row?);
+            let (timestamp, totals) = row?;
+            let group = by_day.entry(day_for(timestamp)).or_default();
+            group.input += totals.input;
+            group.cache_creation += totals.cache_creation;
+            group.cache_read += totals.cache_read;
+            group.output += totals.output;
+            group.responses += totals.responses;
         }
-        Ok(groups)
+        Ok(by_day
+            .into_iter()
+            .map(|(label, totals)| TokenGroup { label, totals })
+            .collect())
     }
 
     /// Shared machinery for the grouped breakdowns.
@@ -471,8 +488,15 @@ mod tests {
             .insert_events(&[usage("m1", at, 5, "/work")])
             .expect("insert");
 
-        let utc = store.tokens_by_day(0, i64::MAX, 0).expect("utc");
-        let manila = store.tokens_by_day(0, i64::MAX, 8 * 3600).expect("manila");
+        let day_at = |offset_seconds: i64, timestamp_us: i64| {
+            ((timestamp_us / 1_000_000 + offset_seconds) / 86_400).to_string()
+        };
+        let utc = store
+            .tokens_by_day(0, i64::MAX, |timestamp| day_at(0, timestamp))
+            .expect("utc");
+        let manila = store
+            .tokens_by_day(0, i64::MAX, |timestamp| day_at(8 * 3600, timestamp))
+            .expect("manila");
 
         assert_ne!(
             utc[0].label, manila[0].label,

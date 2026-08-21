@@ -523,12 +523,12 @@ fn tokens(
     limit: usize,
 ) -> Result<()> {
     let store = open_for_reading(paths)?;
-    let (offset, offset_is_local) = range::local_offset();
+    let (zone, zone_is_local) = range::local_zone();
 
     let range = match (all, from, to) {
-        (true, _, _) => range::all_time(offset),
-        (_, Some(from), Some(to)) => range::explicit(from, to, offset)?,
-        _ => range::last_days(days, offset),
+        (true, _, _) => range::all_time(zone),
+        (_, Some(from), Some(to)) => range::explicit(from, to, zone)?,
+        _ => range::last_days(days, zone),
     };
 
     let totals = store
@@ -536,7 +536,7 @@ fn tokens(
         .context("reading totals")?;
 
     println!("{}", theme::bold(&format!("Token usage — {}", range.label)));
-    if !offset_is_local {
+    if !zone_is_local {
         println!("(times in UTC: the local timezone could not be determined)");
     }
     println!();
@@ -546,7 +546,9 @@ fn tokens(
         Grouping::Project => store.tokens_by_repository(range.from_us, range.to_us),
         Grouping::Directory => store.tokens_by_project(range.from_us, range.to_us),
         Grouping::Model => store.tokens_by_model(range.from_us, range.to_us),
-        Grouping::Day => store.tokens_by_day(range.from_us, range.to_us, range.offset_seconds()),
+        Grouping::Day => store.tokens_by_day(range.from_us, range.to_us, |timestamp| {
+            range.day_label(timestamp)
+        }),
     }
     .context("reading the breakdown")?;
 
@@ -873,8 +875,8 @@ fn confirm(question: &str) -> Result<bool> {
 /// Lists sessions with their counts.
 fn sessions(paths: &Paths, days: u32, limit: u32, show_coverage: bool) -> Result<()> {
     let store = open_for_reading(paths)?;
-    let (offset, _) = range::local_offset();
-    let range = range::last_days(days, offset);
+    let (zone, _) = range::local_zone();
+    let range = range::last_days(days, zone);
 
     let rows = store
         .sessions(range.from_us, range.to_us, limit)
@@ -931,8 +933,8 @@ fn print_coverage(coverage: &Coverage) {
 /// Prints a timeline of events.
 fn activity(paths: &Paths, days: u32, limit: u32, filter: ActivityFilter) -> Result<()> {
     let store = open_for_reading(paths)?;
-    let (offset, _) = range::local_offset();
-    let range = range::last_days(days, offset);
+    let (zone, _) = range::local_zone();
+    let range = range::last_days(days, zone);
 
     let rows = store
         .activity(range.from_us, range.to_us, &filter, limit)
@@ -955,8 +957,8 @@ fn activity(paths: &Paths, days: u32, limit: u32, filter: ActivityFilter) -> Res
 /// Lists access to sensitive paths.
 fn security(paths: &Paths, days: u32, limit: u32) -> Result<()> {
     let store = open_for_reading(paths)?;
-    let (offset, _) = range::local_offset();
-    let range = range::last_days(days, offset);
+    let (zone, _) = range::local_zone();
+    let range = range::last_days(days, zone);
 
     let rows = store
         .notable_access(range.from_us, range.to_us, limit)
@@ -986,8 +988,8 @@ fn export(paths: &Paths, days: u32, limit: u32, kinds: Vec<String>) -> Result<()
     use std::io::Write as _;
 
     let store = open_for_reading(paths)?;
-    let (offset, _) = range::local_offset();
-    let range = range::last_days(days, offset);
+    let (zone, _) = range::local_zone();
+    let range = range::last_days(days, zone);
 
     let filter = ActivityFilter {
         kinds,

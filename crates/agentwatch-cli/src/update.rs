@@ -56,33 +56,15 @@ pub(crate) fn run(options: &Options) -> Result<()> {
     let target = release_target();
     let archive = archive_name(target);
     let tag = options.version.as_deref().map(normalize_tag);
+    let version = release_version(tag.as_deref())?;
     let base = download_base(tag.as_deref());
 
     theme::heading("AgentWatch update");
     let field = |name: &str| theme::paint(&format!("{name:<16}"), theme::MUTED);
     println!("  {}{CURRENT}", field("installed"));
-    println!(
-        "  {}{}",
-        field("updating to"),
-        tag.as_deref().unwrap_or("latest")
-    );
+    println!("  {}{}", field("updating to"), version);
     println!("  {}{}", field("into"), destination.display());
     println!("  {}{}", field("architecture"), target);
-
-    // Asking for the version already installed needs no download to answer.
-    if let Some(tag) = tag.as_deref()
-        && tag.trim_start_matches('v') == CURRENT
-    {
-        println!();
-        println!(
-            "  {}",
-            theme::paint(
-                &format!("Already on {CURRENT}. Nothing to do."),
-                theme::MUTED
-            )
-        );
-        return Ok(());
-    }
 
     if looks_like_a_build_tree(&destination) {
         println!();
@@ -107,7 +89,7 @@ pub(crate) fn run(options: &Options) -> Result<()> {
             destination.display()
         )
     })?;
-    let result = fetch_and_place(&staging, &destination, &base, &archive, options);
+    let result = fetch_and_place(&staging, &destination, &base, &archive, &version, options);
 
     // Whatever happened, do not leave a dot-directory in someone's bin.
     let _ = std::fs::remove_dir_all(&staging);
@@ -120,6 +102,7 @@ fn fetch_and_place(
     destination: &Path,
     base: &str,
     archive: &str,
+    version: &str,
     options: &Options,
 ) -> Result<()> {
     println!();
@@ -156,22 +139,9 @@ fn fetch_and_place(
     if !new.is_file() {
         bail!("{archive} did not contain {REQUIRED}");
     }
-    let version = reported_version(&new)?;
-
-    if version == CURRENT {
-        println!();
-        println!(
-            "  {}",
-            theme::paint(
-                &format!("Already on the latest release ({CURRENT}). Nothing to do."),
-                theme::MUTED
-            )
-        );
-        return Ok(());
-    }
 
     // Only components that are already installed are replaced.
-    let mut moves = vec![(new, destination.join(REQUIRED))];
+    let mut moves = vec![(new.clone(), destination.join(REQUIRED))];
     if staging.join(COMPANION).is_file() && destination.join(COMPANION).is_file() {
         moves.push((staging.join(COMPANION), destination.join(COMPANION)));
     }
@@ -186,8 +156,10 @@ fn fetch_and_place(
     // step back off a bad release is exactly what that flag is for — but it
     // must never be what "update" quietly does because the latest published
     // release happens to be older than the build in hand.
-    let direction = if is_older(&version, CURRENT) {
+    let direction = if is_older(version, CURRENT) {
         theme::paint(&format!("DOWNGRADE  {CURRENT} → {version}"), theme::WARN)
+    } else if version == CURRENT {
+        theme::bold(&format!("REPAIR     {CURRENT}"))
     } else {
         theme::bold(&format!("{CURRENT} → {version}"))
     };
@@ -216,6 +188,16 @@ fn fetch_and_place(
         return Ok(());
     }
 
+    // Running a downloaded executable is materially different from inspecting
+    // it. Do it only after the user has consented, never during `--dry-run`, and
+    // require the binary to agree with the release page that selected it.
+    let reported = reported_version(&new)?;
+    if reported != version {
+        bail!(
+            "downloaded binary reports version {reported}, but the release is {version}; refusing to install"
+        );
+    }
+
     println!();
     for (from, into) in &moves {
         // Renamed rather than written over: the rename swaps the directory
@@ -233,31 +215,15 @@ fn fetch_and_place(
     }
 
     // The reason this is a command and not a documented sequence of steps.
-    for job in &jobs {
-        match service::restart(*job) {
-            Ok(()) => println!(
-                "  {}{}{}",
-                theme::paint("✓ ", theme::GOOD),
-                theme::label("restarted"),
-                theme::paint(job.label(), theme::MUTED)
-            ),
-            Err(error) => println!(
-                "  {}{}{}",
-                theme::paint("✗ ", theme::BAD),
-                theme::label("restart"),
-                theme::paint(
-                    &format!("{error:#} — run `agentwatch init` to repair"),
-                    theme::BAD
-                )
-            ),
-        }
-    }
+    // Failure must reach the exit status: otherwise automation sees success and
+    // the closing message lies while launchd still holds the old inode.
+    restart_jobs_with(&jobs, service::restart)?;
 
     println!();
     println!(
         "  {} {}",
         theme::bold("Updated to"),
-        theme::paint(&version, theme::GOOD)
+        theme::paint(version, theme::GOOD)
     );
     if jobs.is_empty() {
         println!(
@@ -271,13 +237,49 @@ fn fetch_and_place(
         println!(
             "  {}",
             theme::paint(
-                "The collector is running the new build. Hook entries were left alone: they \
-                 already point here.",
+                "The running AgentWatch jobs are using the new build. Hook entries were left \
+                 alone: they already point here.",
                 theme::MUTED
             )
         );
     }
     Ok(())
+}
+
+/// Restarts every job, reporting all failures before returning an error.
+fn restart_jobs_with(
+    jobs: &[service::Job],
+    mut restart: impl FnMut(service::Job) -> Result<()>,
+) -> Result<()> {
+    let mut failures = Vec::new();
+    for job in jobs {
+        match restart(*job) {
+            Ok(()) => println!(
+                "  {}{}{}",
+                theme::paint("✓ ", theme::GOOD),
+                theme::label("restarted"),
+                theme::paint(job.label(), theme::MUTED)
+            ),
+            Err(error) => {
+                println!(
+                    "  {}{}{}",
+                    theme::paint("✗ ", theme::BAD),
+                    theme::label("restart"),
+                    theme::paint(
+                        &format!("{error:#} — run `agentwatch init` to repair"),
+                        theme::BAD
+                    )
+                );
+                failures.push(job.label());
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("failed to restart {}", failures.join(", "))
+    }
 }
 
 /// Where the running executable lives, which is what gets replaced.
@@ -335,6 +337,43 @@ fn download_base(tag: Option<&str>) -> String {
         Some(tag) => format!("https://github.com/{REPOSITORY}/releases/download/{tag}"),
         None => format!("https://github.com/{REPOSITORY}/releases/latest/download"),
     }
+}
+
+/// Resolves the release version without executing anything from its archive.
+fn release_version(tag: Option<&str>) -> Result<String> {
+    if let Some(tag) = tag {
+        return Ok(tag.trim_start_matches('v').to_owned());
+    }
+
+    let url = format!("https://github.com/{REPOSITORY}/releases/latest");
+    let output = std::process::Command::new("curl")
+        .args([
+            "-fsSL",
+            "--proto",
+            "=https",
+            "--tlsv1.2",
+            "-o",
+            "/dev/null",
+            "--write-out",
+            "%{url_effective}",
+            &url,
+        ])
+        .output()
+        .context("resolving the latest release")?;
+    if !output.status.success() {
+        bail!("could not resolve the latest release");
+    }
+
+    let effective = String::from_utf8(output.stdout).context("release URL was not UTF-8")?;
+    version_from_release_url(&effective)
+        .with_context(|| format!("could not read a version from {effective}"))
+}
+
+/// Extracts `0.1.2` from GitHub's `/releases/tag/v0.1.2` redirect target.
+fn version_from_release_url(url: &str) -> Option<String> {
+    let tag = url.trim().split("/releases/tag/").nth(1)?;
+    let tag = tag.split(['?', '#']).next()?.trim_start_matches('v');
+    (!tag.is_empty()).then(|| tag.to_owned())
 }
 
 /// Pulls one file down.
@@ -406,9 +445,9 @@ fn is_older(candidate: &str, current: &str) -> bool {
 
 /// Asks a downloaded binary what version it is.
 ///
-/// The archive name carries no version, and `latest` is a moving target, so this
-/// is the only honest way to report what was installed — and to notice that the
-/// latest release is the one already running.
+/// The release URL supplies the expected version without executing the binary.
+/// This second check, performed only after consent, ensures the archive actually
+/// contains the version selected by that URL or explicit tag.
 fn reported_version(binary: &Path) -> Result<String> {
     std::fs::set_permissions(binary, std::os::unix::fs::PermissionsExt::from_mode(0o755))
         .with_context(|| format!("setting permissions on {}", binary.display()))?;
@@ -443,6 +482,27 @@ mod tests {
     fn no_version_means_the_latest_release() {
         assert!(download_base(None).ends_with("/releases/latest/download"));
         assert!(download_base(Some("v0.1.2")).ends_with("/releases/download/v0.1.2"));
+    }
+
+    #[test]
+    fn the_latest_release_redirect_yields_its_version() {
+        assert_eq!(
+            version_from_release_url(
+                "https://github.com/akosidencio/agentwatch/releases/tag/v0.1.2"
+            )
+            .as_deref(),
+            Some("0.1.2")
+        );
+    }
+
+    #[test]
+    fn restart_failure_makes_the_update_fail() {
+        let error = restart_jobs_with(&[service::Job::Daemon], |_| {
+            anyhow::bail!("launchctl failed")
+        })
+        .expect_err("restart failures must reach the command exit status");
+
+        assert!(format!("{error:#}").contains(service::Job::Daemon.label()));
     }
 
     #[test]

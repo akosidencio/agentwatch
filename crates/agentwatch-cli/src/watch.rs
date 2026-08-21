@@ -99,8 +99,8 @@ fn event_loop(
 
 /// Reads the current state of the world.
 fn snapshot(store: &Store, paths: &Paths) -> Result<Dashboard> {
-    let (offset, _) = range::local_offset();
-    let today = range::last_days(1, offset);
+    let (zone, _) = range::local_zone();
+    let today = range::last_days(1, zone);
 
     Ok(Dashboard {
         totals: store

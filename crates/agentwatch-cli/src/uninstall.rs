@@ -103,6 +103,11 @@ impl Step {
                 | Action::Binaries { .. }
         )
     }
+
+    /// Whether this step is unsafe after an earlier prerequisite failed.
+    const fn requires_clean_run(&self) -> bool {
+        matches!(self.action, Action::Data | Action::Binaries { .. })
+    }
 }
 
 /// Removes AgentWatch from the machine, or reports what that would take.
@@ -149,6 +154,17 @@ pub(crate) fn run(paths: &Paths, options: Options) -> Result<()> {
     let mut failures = Vec::new();
     for step in &steps {
         if !step.is_pending() {
+            continue;
+        }
+        // Keep the executable available for the retry commands, and never purge
+        // a database while a job that should have been stopped may still own it.
+        if !failures.is_empty() && step.requires_clean_run() {
+            println!(
+                "  {}{}{}",
+                theme::paint("· ", theme::FAINT),
+                theme::label(step.label),
+                theme::paint("skipped while an earlier step is unresolved", theme::WARN)
+            );
             continue;
         }
         match apply(paths, &step.action) {
@@ -617,6 +633,35 @@ mod tests {
             .find(|step| step.label == "hooks")
             .expect("hooks step");
         assert!(matches!(hooks.action, Action::Hooks { removed: 4, .. }));
+    }
+
+    #[test]
+    fn destructive_steps_wait_for_prerequisites() {
+        let data = Step {
+            label: "data",
+            retry: "retry",
+            what: String::new(),
+            action: Action::Data,
+        };
+        let binaries = Step {
+            label: "binaries",
+            retry: "retry",
+            what: String::new(),
+            action: Action::Binaries { files: Vec::new() },
+        };
+        let profile = Step {
+            label: "PATH",
+            retry: "retry",
+            what: String::new(),
+            action: Action::Profile {
+                path: PathBuf::new(),
+                updated: String::new(),
+            },
+        };
+
+        assert!(data.requires_clean_run());
+        assert!(binaries.requires_clean_run());
+        assert!(!profile.requires_clean_run());
     }
 
     #[test]
