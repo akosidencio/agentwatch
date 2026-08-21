@@ -14,6 +14,7 @@ mod service;
 mod sync;
 mod theme;
 mod uninstall;
+mod update;
 mod watch;
 mod welcome;
 
@@ -102,6 +103,23 @@ enum Command {
         /// Skip reading the history Claude Code has already written.
         #[arg(long)]
         no_import: bool,
+    },
+    /// Replace the installed binaries with a published release.
+    ///
+    /// Downloads the release for this architecture, verifies it against the
+    /// published SHA256SUMS, puts it in place, and restarts whichever launchd
+    /// jobs are running — which is the step that is easy to forget by hand, and
+    /// without which the collector keeps running the previous build.
+    Update {
+        /// Release to install, e.g. `0.1.2`. Defaults to the latest.
+        #[arg(long, value_name = "VERSION")]
+        version: Option<String>,
+        /// Show what would be replaced and exit.
+        #[arg(long)]
+        dry_run: bool,
+        /// Replace without asking.
+        #[arg(long, short)]
+        yes: bool,
     },
     /// Take AgentWatch back off this machine.
     ///
@@ -271,6 +289,8 @@ enum Command {
 }
 
 fn main() -> Result<()> {
+    quiet_broken_pipe();
+
     // The hook is dispatched before clap, and before anything else that can
     // fail. It runs in the agent's critical path and must exit 0 on every path;
     // clap exits 2 on an argument it does not recognise, and resolving the data
@@ -306,6 +326,15 @@ fn main() -> Result<()> {
                 import: !no_import,
             },
         ),
+        Command::Update {
+            version,
+            dry_run,
+            yes,
+        } => update::run(&update::Options {
+            version,
+            dry_run,
+            assume_yes: yes,
+        }),
         Command::Uninstall {
             dry_run,
             yes,
@@ -380,6 +409,36 @@ fn main() -> Result<()> {
     }
 }
 
+/// Exits quietly when the thing reading our output goes away.
+///
+/// `println!` panics if the pipe is closed, so `agentwatch export | head` ended
+/// in a Rust panic message and exit 101 — on a tool whose one-shot commands are
+/// documented as pipeable. The usual fix is to restore the default `SIGPIPE`
+/// disposition, which needs `libc` and `unsafe`; this workspace forbids
+/// `unsafe`, and that policy is worth more than the exit code, so the panic is
+/// intercepted instead.
+///
+/// Exits 0: `head` closing its end is a normal way for a pipeline to finish,
+/// not a failure of ours.
+fn quiet_broken_pipe() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+
+        // Matched on the message because that is all a panic from `println!`
+        // carries; every other panic still reports normally.
+        if message.contains("Broken pipe") {
+            std::process::exit(0);
+        }
+        previous(info);
+    }));
+}
+
 /// Forwards one hook payload, and never fails doing it.
 fn hook() -> Result<()> {
     use std::io::IsTerminal as _;
@@ -430,7 +489,7 @@ fn status(paths: &Paths) -> Result<()> {
     println!("{}  {}", label("database"), paths.database().display());
 
     if !paths.database().exists() {
-        println!("\nNo database yet. Start the daemon with `agentwatch-daemon`.");
+        println!("\nNo database yet. Run `agentwatch init` to set up.");
         return Ok(());
     }
 
@@ -1025,10 +1084,42 @@ fn verify(paths: &Paths) -> Result<()> {
         return Ok(());
     }
 
+    let responses = drift.transcript_responses - drift.stored_responses;
+    let tokens = drift.transcript_tokens - drift.stored_tokens;
+
+    // Drift has two directions and they mean opposite things. Positive is
+    // transcripts we have not read yet, which importing fixes. Negative is
+    // storage holding responses the transcripts no longer contain — which is
+    // what a compacted or deleted transcript looks like, and telling someone to
+    // import to "read what is missing" in that case sends them to re-read a
+    // file that will never mention it again.
+    if responses < 0 || tokens < 0 {
+        println!(
+            "{}",
+            theme::paint(
+                &format!(
+                    "AHEAD: storage holds {} responses and {} tokens the transcripts no longer contain.",
+                    render::thousands(-responses),
+                    render::thousands(-tokens)
+                ),
+                theme::WARN
+            )
+        );
+        println!("Normal after a session's transcript is compacted or deleted: the database keeps");
+        println!("what it recorded at the time. Nothing to do, and nothing is lost.");
+        return Ok(());
+    }
+
     println!(
-        "DRIFT: {} responses, {} tokens.",
-        render::thousands(drift.transcript_responses - drift.stored_responses),
-        render::thousands(drift.transcript_tokens - drift.stored_tokens)
+        "{}",
+        theme::paint(
+            &format!(
+                "DRIFT: {} responses, {} tokens not yet read.",
+                render::thousands(responses),
+                render::thousands(tokens)
+            ),
+            theme::WARN
+        )
     );
     println!("Run `agentwatch import` to read what is missing.");
     Ok(())
@@ -1038,7 +1129,7 @@ fn verify(paths: &Paths) -> Result<()> {
 pub(crate) fn open_for_reading(paths: &Paths) -> Result<Store> {
     anyhow::ensure!(
         paths.database().exists(),
-        "no database yet at {}\nStart the daemon with `agentwatch-daemon`, or run `agentwatch import`.",
+        "no database yet at {}\nRun `agentwatch init` to set up, or `agentwatch import` to read your history.",
         paths.database().display()
     );
     Store::open_read_only(paths.database()).context("opening the database")
@@ -1047,7 +1138,7 @@ pub(crate) fn open_for_reading(paths: &Paths) -> Result<Store> {
 /// Prints the most recent events.
 fn events(paths: &Paths, limit: u32) -> Result<()> {
     if !paths.database().exists() {
-        println!("No database yet. Start the daemon with `agentwatch-daemon`.");
+        println!("No database yet. Run `agentwatch init` to set up.");
         return Ok(());
     }
 

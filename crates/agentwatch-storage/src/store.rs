@@ -17,7 +17,7 @@ pub enum StoreError {
     /// The database was written by an older build than this one.
     #[error(
         "database is at schema version {found}, this build expects {expected}\n\
-         Run `agentwatch import` or start `agentwatch-daemon` to migrate it."
+         Run `agentwatch import`, or start the collector with `agentwatch daemon`, to migrate it."
     )]
     SchemaTooOld {
         /// Version the database is at.

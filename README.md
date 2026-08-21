@@ -19,6 +19,7 @@ Built in Rust for [Claude Code](https://claude.com/claude-code) on macOS. Everyt
 - [What it solves](#what-it-solves)
 - [Requirements](#requirements)
 - [Install](#install)
+- [Updating](#updating)
 - [Quick start](#quick-start)
 - [Usage](#usage)
 - [What it records, and what it never records](#what-it-records-and-what-it-never-records)
@@ -128,6 +129,18 @@ It is safe to re-run, and worth re-running after an upgrade: steps already done 
 Hooks are read at session start, so open a **new** agent session afterwards. An already-running session is not monitored.
 
 Typing `agentwatch` on its own prints the version, whether it is collecting, and the commands worth knowing. `agentwatch --help` is the full list.
+
+### Updating
+
+```sh
+agentwatch update                  # the latest release
+agentwatch update --version 0.1.2  # a specific one
+agentwatch update --dry-run        # show what would change, change nothing
+```
+
+It fetches the archive for your architecture, verifies it against the published `SHA256SUMS` *before* unpacking, replaces the binaries by rename, and then **restarts whichever launchd jobs are running**. That last step is the reason this is a command: the plist still points at the right path after a manual re-download, but the running collector holds the inode it started with, so it keeps serving the previous build with nothing to say so.
+
+Hook entries are left alone — they already point at the same path. Stepping backwards is allowed but never silent: it is labelled `DOWNGRADE` and needs the same confirmation.
 
 ### Why curl is the only supported install
 
@@ -356,7 +369,9 @@ These are design consequences, stated up front rather than discovered later.
 ## FAQ
 
 **Does AgentWatch send anything anywhere?**
-No. There is no network client in the codebase. Data lives in `~/.agentwatch/agentwatch.db` and nowhere else.
+No. There is no network client in the codebase, and no telemetry, analytics, or update check of any kind. Data lives in `~/.agentwatch/agentwatch.db` and nowhere else.
+
+The one time anything leaves the machine is when you type `agentwatch update`, which shells out to `curl` to fetch a release archive from GitHub — a download, not an upload, and only on request. Keeping the transport out of the binary is deliberate: it is what makes the sentence above checkable with `grep`.
 
 **Will it slow down my agent?**
 The hook adds a measured ~9ms per tool call, and that cost is process spawn rather than anything AgentWatch computes — which is also why [the menu bar is a separate binary](#why-the-menu-bar-is-its-own-binary). It exits 0 on every path, so it cannot fail a tool call even when the daemon is down.

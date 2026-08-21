@@ -32,6 +32,7 @@ const GROUPS: [(&str, &[(&str, &str)]); 3] = [
             ("init", "set up hooks, the collector, and history"),
             ("service", "manage the background jobs"),
             ("pause / resume", "stop and start recording"),
+            ("update", "fetch a newer release and restart"),
             ("uninstall", "take it all back off this machine"),
         ],
     ),

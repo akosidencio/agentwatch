@@ -52,6 +52,7 @@ dependencies = [
  "crossterm 0.29.0",
  "ratatui",
  "serde_json",
+ "sha2",
  "tempfile",
  "time",
 ]

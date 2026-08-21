@@ -347,6 +347,20 @@ pub(crate) fn bootout(job: Job) -> Result<()> {
     run(&["bootout", &format!("gui/{}/{}", user_id(), job.label())])
 }
 
+/// Restarts a loaded job so it runs the binary that is on disk now.
+///
+/// The point of the whole exercise after an update: the plist still points at
+/// the right path, but the running process holds the inode it started with, so
+/// without this the collector keeps serving the previous build indefinitely and
+/// nothing says so.
+pub(crate) fn restart(job: Job) -> Result<()> {
+    run(&[
+        "kickstart",
+        "-k",
+        &format!("gui/{}/{}", user_id(), job.label()),
+    ])
+}
+
 /// Runs launchctl and turns a non-zero exit into an error with its output.
 fn run(arguments: &[&str]) -> Result<()> {
     let output = std::process::Command::new("launchctl")
