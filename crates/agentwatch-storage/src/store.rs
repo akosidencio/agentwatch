@@ -967,3 +967,20 @@ mod tests {
         assert_eq!(started, 1_000_000);
     }
 }
+
+#[cfg(test)]
+mod file_backed_tests {
+    use super::*;
+
+    #[test]
+    fn opening_a_fresh_file_applies_every_migration() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("events.db");
+
+        let store = Store::open(&path).expect("first open should migrate cleanly");
+        drop(store);
+
+        let store = Store::open(&path).expect("re-opening must not re-apply");
+        drop(store);
+    }
+}

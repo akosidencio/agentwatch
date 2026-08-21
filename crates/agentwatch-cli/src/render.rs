@@ -59,6 +59,10 @@ pub(crate) fn session_line(row: &SessionRow) -> String {
         "-".to_owned()
     };
 
+    // Never observed, rather than a default. Only transcripts carry the field,
+    // so a session seen purely through hooks has none until it is reconciled.
+    let surface = row.surface.as_deref().unwrap_or("?");
+
     format!(
         "{:<8}  {started:<16}  {duration:<9}  {:>13}  {:>4}  {:>4}  {:>4}  {sensitive:>4}  {surface:<13}  {project}",
         &row.id[..8.min(row.id.len())],
@@ -268,6 +272,7 @@ mod tests {
             agent_id: "claude-code".to_owned(),
             project: Some("/work/acme".to_owned()),
             git_branch: None,
+            surface: Some("claude-vscode".to_owned()),
             started_at_us: Some(1_755_000_000_000_000),
             duration_ms: None,
             status: "active".to_owned(),
@@ -334,6 +339,7 @@ mod tests {
             agent_id: "claude-code".to_owned(),
             project: None,
             git_branch: None,
+            surface: Some("claude-vscode".to_owned()),
             started_at_us: Some(1_755_000_000_000_000),
             duration_ms: None,
             status: "unknown".to_owned(),
@@ -359,6 +365,7 @@ mod tests {
             agent_id: "claude-code".to_owned(),
             project: None,
             git_branch: None,
+            surface: Some("claude-vscode".to_owned()),
             started_at_us: None,
             duration_ms: Some(1_000),
             status: "ended".to_owned(),

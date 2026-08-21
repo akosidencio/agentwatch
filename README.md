@@ -23,6 +23,7 @@ Built in Rust for [Claude Code](https://claude.com/claude-code) on macOS. Everyt
 - [Usage](#usage)
 - [What it records, and what it never records](#what-it-records-and-what-it-never-records)
 - [How it works](#how-it-works)
+- [Where it works](#where-it-works)
 - [Known limitations](#known-limitations)
 - [Roadmap](#roadmap)
 - [FAQ](#faq)
@@ -68,6 +69,25 @@ Token totals are exact. `agentwatch verify` re-derives them from Claude Code's o
 - Nothing else. SQLite is bundled; there is no runtime to install.
 
 Linux, Windows, and other agents (Codex, Gemini) are not supported yet — see [Roadmap](#roadmap).
+
+### Where it works
+
+Every local surface shares one `~/.claude/settings.json`, so `install-hooks`
+covers all of them at once.
+
+| Surface | Monitored | |
+|---|---|---|
+| VS Code extension | Yes | verified — every transcript on this machine reports `claude-vscode`, and hooks execute |
+| Claude Code CLI | Yes | same binary, same config directory, same transcripts |
+| JetBrains extension | Expected | runs Claude Code locally against the same config |
+| Desktop app (macOS) | Expected | local process, same config directory |
+| Desktop app (Windows) | No | macOS only — Unix socket and launchd |
+| **Claude Code web** (claude.ai/code) | **No, and cannot** | the agent runs on Anthropic's infrastructure |
+| Cloud / remote sessions | No | same reason |
+| `claude` over SSH | The remote host | hooks and transcripts land there, not here |
+
+Hooks are read at session start, so a session already running when you install
+them stays unmonitored until you open a new one.
 
 ## Install
 
@@ -143,7 +163,7 @@ Four counters are tracked separately — input, output, cache creation, and cach
 ### Sessions and activity
 
 ```sh
-agentwatch sessions --days 7 --coverage             # counts, plus what was observed
+agentwatch sessions --days 7 --coverage             # counts, surface, and what was observed
 agentwatch activity --days 1 --kind command,file.write
 agentwatch activity --days 7 --project ~/code/myrepo
 agentwatch security --days 7                        # access to sensitive paths
@@ -191,6 +211,16 @@ Live agent state, today's tokens, alert count, and a pause toggle in the macOS m
 ```sh
 cargo build -p agentwatch-menubar --release
 ```
+
+### Which surface a session ran in
+
+`agentwatch sessions` shows a `surface` column carrying Claude Code's own
+`entrypoint` value — `claude-vscode` for the VS Code extension, and so on. It is
+stored verbatim rather than mapped onto an enum of ours, so a value we have
+never seen shows up as itself instead of collapsing into `Other`.
+
+Only transcripts carry the field, so a session seen purely through hooks reads
+as `?` until it is reconciled. That is *unknown*, not a default.
 
 ## What it records, and what it never records
 
@@ -246,6 +276,9 @@ These are design consequences, stated up front rather than discovered later.
 - **Command lines are scanned, not parsed.** `cat .env` is caught; `eval`, variable expansion, and heredocs are not. Anything recovered this way is labelled `derived` and never mixed in with tool-reported file events.
 - **Secrets inside command lines are stored unscrubbed.** Scrubbing for the obvious shapes is not implemented.
 - **Collection can be paused, and can be switched off entirely by editing the agent's settings.** Neither is prevented — nothing running as your own user could prevent it. Both are *recorded*: a pause writes `collection.paused`, and hooks disappearing from the settings file writes `config.changed`. A gap in the timeline should say why it is there rather than looking like an idle agent.
+- **Claude Code web (claude.ai/code) is not monitored, and cannot be.** The agent runs on Anthropic's infrastructure, so there is no local process to hook, no local socket to reach, and no transcript written to your disk. The same applies to cloud and remote sessions. A quiet day in `agentwatch tokens` may only mean you worked in the browser.
+- **`claude` run over SSH monitors the remote machine, not yours.** Hooks and transcripts land on whichever host the agent runs on.
+- **Windows is not supported.** The daemon uses a Unix domain socket and the service uses launchd.
 - **Cost is not estimated.** On a subscription the per-token price is a number nobody pays, so tokens are the headline and cost stays opt-in until it can be labelled honestly.
 - **Attempted-but-denied tool calls are not recorded.** `PreToolUse` needs a real captured payload to confirm a pre-hook can be correlated to its post-hook; installing both without that would double every tool call's rows for no gain.
 - **Claude Code's transcript format is undocumented.** AgentWatch is pinned to it, and a format change will need a release. `agentwatch verify` is how you find out.
@@ -256,7 +289,7 @@ These are design consequences, stated up front rather than discovered later.
 
 ### Shipped — v0.1.0
 
-Claude Code on macOS, local only. 267 tests, clippy clean.
+Claude Code on macOS, local only. 304 tests, clippy clean.
 
 - [x] **Hook → daemon → SQLite pipeline** — ~7ms median per tool call, exits 0 on every path
 - [x] **Exact token accounting** — deduplicated by `message.id`, 0 drift across 149 transcripts

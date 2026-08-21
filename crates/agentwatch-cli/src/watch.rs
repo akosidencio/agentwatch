@@ -314,6 +314,7 @@ mod tests {
             agent_id: "claude-code".to_owned(),
             project: Some("/work/acme".to_owned()),
             git_branch: Some("main".to_owned()),
+            surface: Some("claude-vscode".to_owned()),
             started_at_us: Some(1_755_000_000_000_000),
             duration_ms: None,
             status: status.to_owned(),

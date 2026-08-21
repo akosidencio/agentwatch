@@ -275,7 +275,7 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
     ",
     },
     Migration {
-        version: 7,
+        version: 8,
         name: "session_surface",
         sql: r"
         -- Which surface the agent ran in: Claude Code's `entrypoint`, stored
