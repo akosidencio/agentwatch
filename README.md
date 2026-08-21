@@ -71,9 +71,7 @@ Linux, Windows, and other agents (Codex, Gemini) are not supported yet — see [
 
 ## Install
 
-> **Not published yet.** The commands below are the *only* installation path AgentWatch will support, but the first tagged release has not been cut, so the URLs 404 today. Until then, [build from source](#build-from-source). Everything after the download step is already implemented and works.
-
-Install with `curl` from the binary releases page:
+Install with `curl` from the [binary releases page](https://github.com/akosidencio/agentwatch/releases). This is the only supported installation path — [there is no Homebrew formula and no `cargo install`](#why-curl-is-the-only-supported-install).
 
 ```sh
 curl -fsSL https://github.com/akosidencio/agentwatch/releases/latest/download/install.sh | sh
@@ -256,29 +254,47 @@ These are design consequences, stated up front rather than discovered later.
 
 ## Roadmap
 
-**v0.1.0 — shipped.** Claude Code, macOS, local only. Phases 1–4 complete: the hook → daemon → SQLite spine, exact token reconciliation, the CLI and live TUI, and the menu bar plus safe hook and service installation. 267 tests, clippy clean.
+### Shipped — v0.1.0
 
-**Next up**
+Claude Code on macOS, local only. 267 tests, clippy clean.
 
-| | Why it's next |
-|---|---|
-| **Binary releases + `curl` installer** | The install path documented above is the whole distribution story, and it does not exist yet. Highest priority. |
-| **`PreToolUse` correlation** | Recording what an agent *tried* to do and was denied. Now unblockable: with hooks installable, a real session produces the payloads needed to confirm a correlation id exists. |
-| **Secret scrubbing in command lines** | The one place where AgentWatch can store something you did not intend to keep. |
-| **Agent #2 (Codex, Gemini)** | The adapter trait has existed since phase 1 for exactly this. Agent #2 is where the product starts; agent #1 proved the pipeline. |
+- [x] **Hook → daemon → SQLite pipeline** — ~7ms median per tool call, exits 0 on every path
+- [x] **Exact token accounting** — deduplicated by `message.id`, 0 drift across 149 transcripts
+- [x] **Full history import** — `agentwatch import`, idempotent
+- [x] **Repository rollup** — 170 working directories resolved to 39 repositories
+- [x] **CLI** — `tokens`, `sessions`, `activity`, `security`, `events`, `export`, `status`
+- [x] **Live TUI** — `agentwatch watch`
+- [x] **macOS menu bar** — agent state, today's tokens, alert count, pause toggle
+- [x] **Safe installation** — `install-hooks` and `service install`, both diff-then-ask
+- [x] **Sensitive path classification** — at ingest, hook-observed and command-derived kept apart
+- [x] **Tamper and pause records** — `config.changed`, `collection.paused` / `collection.resumed`
+- [x] **JSON Lines export** — everything the CLI does not print
+- [x] **Drift verification** — `agentwatch verify`
+- [x] **Signed-off release pipeline** — tag-triggered, gated on fmt, clippy, and the full test suite; publishes both macOS architectures with checksums
 
-**Later, deliberately deferred**
+### Next — planned features
 
-| Deferred | Why |
-|---|---|
-| Full web dashboard | Largest cost, least informative about demand. The CLI answers the same question and the TUI covers the live case for a fraction of the cost. |
-| Cost estimation | Misleading for subscription users. Opt-in later, labelled as API-equivalent. |
-| Network monitoring | Not attributable to a PID without a Network Extension. Cannot be delivered honestly. |
-| Process tree | Polling misses short-lived children and fights the idle-CPU target. |
-| Policy engine / rules | Nothing to enforce yet. |
-| OTLP receiver | Would remove the per-tool-call process spawn. Evaluate once it is clear what the hooks miss. |
-| Retention and vacuum | Needs data worth expiring first. |
-| Linux and Windows | macOS first, because that is where this is dogfooded daily. |
+- [ ] **`PreToolUse` correlation** — record what an agent *tried* to do and was denied, not only what completed. Blocked until a real session confirms a pre-hook can be correlated to its post-hook; installing both without that would double every tool call's rows.
+- [ ] **Secret scrubbing in command lines** — the one place AgentWatch can store something you did not intend to keep.
+- [ ] **A second agent adapter (Codex, Gemini)** — the adapter trait has existed since phase 1 for exactly this. Agent #2 is where the product starts; agent #1 proved the pipeline.
+- [ ] **Session diff and summary** — what changed in a repository over a session, from the file events already recorded.
+- [ ] **Alerting on sensitive access** — a notification when something reads a credential path, rather than finding it in `agentwatch security` a week later.
+
+### Later — wanted, not scheduled
+
+- [ ] **Opt-in cost estimation** — labelled as API-equivalent, because on a subscription the per-token price is a number nobody actually pays.
+- [ ] **Retention and vacuum** — needs data worth expiring first.
+- [ ] **OTLP receiver** — would remove the per-tool-call process spawn entirely. Worth evaluating once it is clear what the hooks miss.
+- [ ] **Linux and Windows** — macOS first, because that is where this is dogfooded daily.
+- [ ] **Policy engine / rules file** — there is nothing to enforce yet.
+- [ ] **Web dashboard** — largest cost in the original spec, least informative about demand. The CLI answers the same question and the TUI covers the live case for a fraction of the cost.
+
+### Not planned
+
+- **Homebrew, `cargo install`, npm, Nix** — [one channel, one artifact, one version](#why-curl-is-the-only-supported-install).
+- **Network monitoring** — traffic is not attributable to a PID without a Network Extension, so it cannot be delivered honestly.
+- **Process tree sampling** — polling misses short-lived children and fights the idle-CPU target.
+- **Any hosted or cloud component** — no accounts, no sync, no telemetry. The absence is the product.
 
 ## FAQ
 
@@ -305,7 +321,7 @@ It is an audit trail, not a control. It observes and records; it does not block,
 
 ## Build from source
 
-Needed until the first binary release exists.
+For development, or if you would rather not run a binary you did not compile. The [installer](#install) is the supported path for everyone else.
 
 ```sh
 git clone https://github.com/akosidencio/agentwatch
@@ -318,26 +334,6 @@ cp target/release/agentwatch target/release/agentwatch-daemon target/release/age
 
 agentwatch install-hooks
 agentwatch service install
-```
-
-Requires Rust 1.90+ (edition 2024). `unsafe_code` is forbidden workspace-wide.
-
-Running the daemon in the foreground instead of as a service, for development:
-
-```sh
-./target/release/agentwatch-daemon
-```
-
-### Releasing
-
-`.github/workflows/ci.yml` runs fmt, clippy, and the tests on every push and pull request, plus a separate job that keeps the opt-in menu bar crate compiling.
-
-`.github/workflows/release.yml` is triggered by pushing a `v*` tag. It re-runs fmt, clippy, and the full test suite against the tagged commit — a tag can point at a commit CI never saw — checks that the tag matches the workspace version, then builds `aarch64-apple-darwin` and `x86_64-apple-darwin` natively on their own runners, smoke-tests the binaries, and publishes the archives, `SHA256SUMS`, and `install.sh` to the releases page.
-
-```sh
-# bump [workspace.package] version in Cargo.toml first; the tag must match
-git tag v0.1.0
-git push origin v0.1.0
 ```
 
 ## Uninstall
