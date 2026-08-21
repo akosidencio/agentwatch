@@ -11,6 +11,7 @@
 //! session can be reconciled any number of times without a total moving.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use agentwatch_adapter_claude::{derived_transcript_path, read_token_usage, transcript_root};
 use agentwatch_storage::{PendingSession, Store, StoreError};
@@ -21,6 +22,15 @@ use agentwatch_types::{RepositoryResolver, Timestamp};
 /// A bound rather than "everything": a first run against months of history
 /// should not hold the write connection for minutes.
 const SWEEP_LIMIT: u32 = 200;
+
+/// How long a transcript must sit untouched before its session is finished.
+///
+/// Only an observed `SessionEnd` proves a session is over. For everything else
+/// — imported history, sessions that began before the daemon did — the file's
+/// own stillness is the available evidence. An hour is far longer than any gap
+/// within a live session and far shorter than the age of imported history, so
+/// it retires the backlog without freezing a session that is still running.
+const TRANSCRIPT_IDLE: Duration = Duration::from_secs(3_600);
 
 /// What one reconcile pass did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -33,6 +43,8 @@ pub struct ReconcileReport {
     pub responses: u64,
     /// Rows actually written, after deduplication against what was stored.
     pub written: u64,
+    /// Sessions that will never be read again.
+    pub finished: u64,
 }
 
 /// Reads one session's transcript and stores whatever it reports.
@@ -52,13 +64,20 @@ pub fn reconcile_session(
         ..ReconcileReport::default()
     };
 
+    let now = Timestamp::now().as_micros();
+
+    // Recorded even when there is nothing to read, so a session whose
+    // transcript is gone moves to the back of the queue instead of being
+    // re-examined ahead of everything else on every sweep.
     let Some(path) = locate_transcript(session, root) else {
         report.missing_transcripts = 1;
+        store.mark_reconcile_attempted(&session.session_id, now)?;
         return Ok(report);
     };
 
     let Ok((events, summary)) = read_token_usage(&path) else {
         report.missing_transcripts = 1;
+        store.mark_reconcile_attempted(&session.session_id, now)?;
         return Ok(report);
     };
 
@@ -77,8 +96,36 @@ pub fn reconcile_session(
         );
     }
 
-    store.mark_reconciled(&session.session_id, Timestamp::now().as_micros())?;
+    if is_finished(session, &path) {
+        report.finished = 1;
+        store.mark_reconciled(&session.session_id, now)?;
+    } else {
+        store.mark_reconcile_attempted(&session.session_id, now)?;
+    }
+
     Ok(report)
+}
+
+/// Whether a session's transcript has stopped growing.
+///
+/// An observed end settles it. Otherwise the file's own modification time is
+/// the evidence: a session nobody watched start cannot be declared over on the
+/// strength of its database row, and marking it done would freeze its totals
+/// mid-flight — but leaving it pending forever means its transcript is re-read
+/// on every sweep for the life of the installation.
+fn is_finished(session: &PendingSession, transcript: &Path) -> bool {
+    if session.status == "ended" {
+        return true;
+    }
+
+    std::fs::metadata(transcript)
+        .and_then(|metadata| metadata.modified())
+        .and_then(|modified| {
+            std::time::SystemTime::now()
+                .duration_since(modified)
+                .map_err(|_| std::io::Error::other("transcript is modified in the future"))
+        })
+        .is_ok_and(|idle| idle >= TRANSCRIPT_IDLE)
 }
 
 /// Finds a session's transcript.
@@ -120,6 +167,7 @@ pub fn sweep(store: &mut Store) -> Result<ReconcileReport, StoreError> {
         report.missing_transcripts += one.missing_transcripts;
         report.responses += one.responses;
         report.written += one.written;
+        report.finished += one.finished;
     }
 
     // Same cadence as the rest of the sweep: cheap, and a change made while we
@@ -129,10 +177,11 @@ pub fn sweep(store: &mut Store) -> Result<ReconcileReport, StoreError> {
     // Resolution touches the filesystem, so it runs here rather than on the
     // write path. Cheap to repeat: only newly seen directories are examined.
     match store.backfill_repositories(&mut RepositoryResolver::new()) {
-        Ok(backfill) if backfill.projects > 0 => tracing::info!(
+        Ok(backfill) if backfill.projects > 0 || backfill.linked_rows > 0 => tracing::info!(
             directories = backfill.projects,
             repositories = backfill.repositories,
             unresolved = backfill.unresolved,
+            linked = backfill.linked_rows,
             "resolved directories to repositories"
         ),
         Ok(_) => {}
@@ -145,6 +194,7 @@ pub fn sweep(store: &mut Store) -> Result<ReconcileReport, StoreError> {
             responses = report.responses,
             written = report.written,
             missing = report.missing_transcripts,
+            finished = report.finished,
             "reconciled sessions against their transcripts"
         );
     }
@@ -253,6 +303,114 @@ mod tests {
         let report = reconcile_session(&mut store, &pending[0], &elsewhere).expect("no error");
         assert_eq!(report.missing_transcripts, 1);
         assert_eq!(report.responses, 0);
+    }
+
+    /// A session whose start was never observed, with a transcript on disk.
+    ///
+    /// The shape every row imported from history has: status `unknown`, so
+    /// nothing about the row itself says whether it is still running.
+    fn unwatched_fixture(age: Duration) -> (Store, tempfile::TempDir, PathBuf) {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let root = directory.path().join("projects");
+        let project = root.join("-work");
+        std::fs::create_dir_all(&project).expect("create");
+
+        let transcript = project.join("s-1.jsonl");
+        std::fs::write(&transcript, TRANSCRIPT).expect("write");
+        let modified = std::time::SystemTime::now() - age;
+        std::fs::File::options()
+            .write(true)
+            .open(&transcript)
+            .expect("open")
+            .set_modified(modified)
+            .expect("backdate");
+
+        let mut store = Store::open_in_memory().expect("schema");
+        store
+            .insert_events(&[AgentEvent::observed(
+                AgentId::CLAUDE_CODE,
+                EvidenceSource::Transcript,
+                Event::SessionStarted(SessionStarted::default()),
+            )
+            .with_session(ExternalSessionId::from("s-1".to_owned()))
+            .with_project_path("/work".to_owned())])
+            .expect("insert");
+        store
+            .connection_for_test()
+            .execute("UPDATE sessions SET status = 'unknown'", [])
+            .expect("demote");
+
+        (store, directory, root)
+    }
+
+    #[test]
+    fn an_unwatched_session_with_a_still_growing_transcript_stays_pending() {
+        let (mut store, _guard, root) = unwatched_fixture(Duration::from_secs(0));
+        let pending = store.sessions_awaiting_reconcile(10).expect("pending");
+
+        let report = reconcile_session(&mut store, &pending[0], &root).expect("reconcile");
+        assert_eq!(report.finished, 0, "it may still be running");
+        assert_eq!(
+            store
+                .sessions_awaiting_reconcile(10)
+                .expect("pending")
+                .len(),
+            1,
+            "its totals must not be frozen mid-flight"
+        );
+    }
+
+    #[test]
+    fn an_unwatched_session_whose_transcript_went_quiet_is_retired() {
+        let (mut store, _guard, root) = unwatched_fixture(TRANSCRIPT_IDLE * 2);
+        let pending = store.sessions_awaiting_reconcile(10).expect("pending");
+
+        let report = reconcile_session(&mut store, &pending[0], &root).expect("reconcile");
+        assert_eq!(report.finished, 1);
+        assert!(
+            store
+                .sessions_awaiting_reconcile(10)
+                .expect("pending")
+                .is_empty(),
+            "imported history should not be re-read forever"
+        );
+    }
+
+    /// The starvation regression: a bounded sweep ordered newest-first re-read
+    /// the same head of the queue on every pass and never reached the tail.
+    #[test]
+    fn a_bounded_sweep_works_through_every_pending_session() {
+        let mut store = Store::open_in_memory().expect("schema");
+        for index in 0..5 {
+            store
+                .insert_events(&[AgentEvent::observed(
+                    AgentId::CLAUDE_CODE,
+                    EvidenceSource::Transcript,
+                    Event::SessionStarted(SessionStarted::default()),
+                )
+                .with_session(ExternalSessionId::from(format!("s-{index}")))
+                .at(agentwatch_types::Timestamp::from_micros(
+                    1_000_000 * (index + 1),
+                ))])
+                .expect("insert");
+        }
+        store
+            .connection_for_test()
+            .execute("UPDATE sessions SET status = 'unknown'", [])
+            .expect("demote");
+
+        // Two sessions per sweep, with no transcripts anywhere to read.
+        let elsewhere = PathBuf::from("/nonexistent/projects");
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..3 {
+            let batch = store.sessions_awaiting_reconcile(2).expect("pending");
+            for session in &batch {
+                seen.insert(session.session_id.clone());
+                reconcile_session(&mut store, session, &elsewhere).expect("reconcile");
+            }
+        }
+
+        assert_eq!(seen.len(), 5, "every session should have had a turn");
     }
 
     /// Test-only stand-in for [`sweep`], which reads the real home directory.

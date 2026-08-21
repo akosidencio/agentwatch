@@ -109,6 +109,12 @@ pub fn derived_transcript_path(
     root.join(slug).join(format!("{session_id}.jsonl"))
 }
 
+/// Deepest directory nesting [`find_transcripts`] will descend into.
+///
+/// A guard against pathological trees, not a real limit: the layout is two
+/// levels deep and nothing legitimate approaches this.
+const MAX_SEARCH_DEPTH: usize = 16;
+
 /// Finds every transcript beneath a directory.
 ///
 /// Returns paths only; reading them is the caller's decision, since a full
@@ -117,23 +123,38 @@ pub fn derived_transcript_path(
 #[must_use]
 pub fn find_transcripts(root: &Path) -> Vec<std::path::PathBuf> {
     let mut found = Vec::new();
-    collect_transcripts(root, &mut found);
+    collect_transcripts(root, MAX_SEARCH_DEPTH, &mut found);
     found.sort();
     found
 }
 
 /// Recursive half of [`find_transcripts`].
-fn collect_transcripts(directory: &Path, found: &mut Vec<std::path::PathBuf>) {
+///
+/// Symlinked directories are not followed and the depth is bounded. Both matter
+/// for the same reason: this walks a directory the user can put anything in,
+/// and a symlink pointing at its own parent would otherwise recurse until the
+/// stack ran out.
+fn collect_transcripts(directory: &Path, depth: usize, found: &mut Vec<std::path::PathBuf>) {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
     };
+
     for entry in entries.flatten() {
+        // `DirEntry::file_type` does not follow symlinks, so a link to a
+        // directory is neither descended into nor mistaken for a transcript.
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
         let path = entry.path();
-        if path.is_dir() {
-            collect_transcripts(&path, found);
-        } else if path
-            .extension()
-            .is_some_and(|extension| extension == "jsonl")
+
+        if kind.is_dir() {
+            if let Some(remaining) = depth.checked_sub(1) {
+                collect_transcripts(&path, remaining, found);
+            }
+        } else if kind.is_file()
+            && path
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
         {
             found.push(path);
         }
@@ -253,7 +274,9 @@ fn to_event(
         event = event.with_project_path(cwd);
     }
 
-    event.with_git_branch(record.git_branch.clone())
+    event
+        .with_git_branch(record.git_branch.clone())
+        .with_surface(record.entrypoint.clone())
 }
 
 /// Reads a usage counter, treating anything non-numeric as absent.
@@ -285,6 +308,12 @@ struct TranscriptRecord {
     cwd: Option<String>,
     /// Git branch at the time, when the session was inside a repository.
     git_branch: Option<String>,
+    /// Which surface the session ran in, for example `claude-vscode`.
+    ///
+    /// Present on every record of every transcript observed so far, but read as
+    /// optional like everything else here — the format is undocumented and this
+    /// reader must not start failing if a field disappears.
+    entrypoint: Option<String>,
     /// Whether this turn belongs to a subagent rather than the main thread.
     is_sidechain: bool,
     /// The model message.
@@ -348,6 +377,21 @@ mod tests {
         let found = find_transcripts(directory.path());
         assert_eq!(found.len(), 1);
         assert!(found[0].ends_with("a.jsonl"));
+    }
+
+    #[test]
+    fn a_symlink_loop_does_not_run_the_search_off_the_stack() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let project = directory.path().join("-work-acme");
+        std::fs::create_dir_all(&project).expect("create");
+        std::fs::write(project.join("a.jsonl"), "").expect("write");
+
+        // A link pointing back at its own ancestor: the shape that used to
+        // recurse until the stack ran out.
+        std::os::unix::fs::symlink(directory.path(), project.join("loop")).expect("symlink");
+
+        let found = find_transcripts(directory.path());
+        assert_eq!(found.len(), 1, "the real transcript, exactly once");
     }
 
     #[test]

@@ -19,8 +19,17 @@ pub(crate) const SECURITY_CAVEAT: &str = concat!(
 /// Column header for a session listing.
 pub(crate) fn session_header() -> String {
     format!(
-        "{:<8}  {:<16}  {:<9}  {:>13}  {:>4}  {:>4}  {:>4}  {:>4}  {}",
-        "session", "started", "duration", "tokens", "cmd", "file", "mcp", "sens", "project"
+        "{:<8}  {:<16}  {:<9}  {:>13}  {:>4}  {:>4}  {:>4}  {:>4}  {:<13}  {}",
+        "session",
+        "started",
+        "duration",
+        "tokens",
+        "cmd",
+        "file",
+        "mcp",
+        "sens",
+        "surface",
+        "project"
     )
 }
 
@@ -51,7 +60,7 @@ pub(crate) fn session_line(row: &SessionRow) -> String {
     };
 
     format!(
-        "{:<8}  {started:<16}  {duration:<9}  {:>13}  {:>4}  {:>4}  {:>4}  {sensitive:>4}  {project}",
+        "{:<8}  {started:<16}  {duration:<9}  {:>13}  {:>4}  {:>4}  {:>4}  {sensitive:>4}  {surface:<13}  {project}",
         &row.id[..8.min(row.id.len())],
         thousands(row.tokens),
         row.commands,
@@ -272,6 +281,50 @@ mod tests {
         let line = session_line(&row);
         assert!(line.contains("running"), "{line}");
         assert!(line.contains("abcdef12"), "{line}");
+    }
+
+    #[test]
+    fn the_surface_is_shown_when_known() {
+        let row = SessionRow {
+            id: "abcdef1234".to_owned(),
+            agent_id: "claude-code".to_owned(),
+            project: None,
+            git_branch: None,
+            surface: Some("claude-vscode".to_owned()),
+            started_at_us: Some(1),
+            duration_ms: Some(1_000),
+            status: "ended".to_owned(),
+            tokens: 0,
+            responses: 0,
+            commands: 0,
+            files: 0,
+            mcp_calls: 0,
+            sensitive: 0,
+        };
+        assert!(session_line(&row).contains("claude-vscode"));
+    }
+
+    #[test]
+    fn an_unobserved_surface_reads_as_unknown_not_as_a_default() {
+        let row = SessionRow {
+            id: "abcdef1234".to_owned(),
+            agent_id: "claude-code".to_owned(),
+            project: None,
+            git_branch: None,
+            surface: None,
+            started_at_us: Some(1),
+            duration_ms: Some(1_000),
+            status: "ended".to_owned(),
+            tokens: 0,
+            responses: 0,
+            commands: 0,
+            files: 0,
+            mcp_calls: 0,
+            sensitive: 0,
+        };
+        let line = session_line(&row);
+        assert!(line.contains('?'), "{line}");
+        assert!(!line.contains("claude"), "must not invent a surface");
     }
 
     #[test]

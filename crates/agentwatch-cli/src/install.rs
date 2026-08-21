@@ -479,17 +479,24 @@ pub(crate) mod file {
     /// The write is a temp file plus a rename, so an interrupted run leaves the
     /// original intact rather than a half-written config for the agent to choke
     /// on at next launch.
+    ///
+    /// The original file's permissions are carried onto the replacement. A
+    /// rename swaps the inode, so without this a settings file the user had
+    /// deliberately locked down to `0600` would come back at whatever the
+    /// process umask allows — a security tool has no business widening the
+    /// permissions of the file it was asked to edit.
     pub(crate) fn write(path: &Path, settings: &Value) -> Result<Option<PathBuf>> {
         let directory = path.parent().unwrap_or(Path::new("."));
         std::fs::create_dir_all(directory)
             .with_context(|| format!("creating {}", directory.display()))?;
 
+        let existing_mode = std::fs::metadata(path).ok().map(|metadata| {
+            use std::os::unix::fs::PermissionsExt as _;
+            metadata.permissions().mode()
+        });
+
         let backup = if path.exists() {
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_secs())
-                .unwrap_or_default();
-            let backup = path.with_extension(format!("json.agentwatch-backup-{stamp}"));
+            let backup = backup_path(path);
             std::fs::copy(path, &backup)
                 .with_context(|| format!("backing up to {}", backup.display()))?;
             Some(backup)
@@ -506,12 +513,41 @@ pub(crate) mod file {
                 .with_context(|| format!("creating {}", temporary.display()))?;
             file.write_all(text.as_bytes())
                 .context("writing settings")?;
+
+            if let Some(mode) = existing_mode {
+                use std::os::unix::fs::PermissionsExt as _;
+                file.set_permissions(std::fs::Permissions::from_mode(mode))
+                    .with_context(|| format!("restoring the mode of {}", path.display()))?;
+            }
+
             file.sync_all().context("flushing settings")?;
         }
         std::fs::rename(&temporary, path)
             .with_context(|| format!("replacing {}", path.display()))?;
 
         Ok(backup)
+    }
+
+    /// Picks a backup name that is not already taken.
+    ///
+    /// Stamped to the second, then disambiguated: two runs within the same
+    /// second would otherwise have the second one overwrite the first one's
+    /// backup, which is precisely when having both matters.
+    fn backup_path(path: &Path) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or_default();
+
+        let candidate = path.with_extension(format!("json.agentwatch-backup-{stamp}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+
+        (1..)
+            .map(|suffix| path.with_extension(format!("json.agentwatch-backup-{stamp}-{suffix}")))
+            .find(|candidate| !candidate.exists())
+            .unwrap_or(candidate)
     }
 }
 
@@ -576,6 +612,54 @@ mod file_tests {
         assert!(
             permissions < model && model < hooks,
             "order changed:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_restrictive_mode_survives_the_rewrite() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("settings.json");
+        std::fs::write(&path, r#"{"model":"opus"}"#).expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+
+        file::write(&path, &json!({ "model": "sonnet" })).expect("write");
+
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "a rename must not widen the permissions of the file it replaces"
+        );
+    }
+
+    #[test]
+    fn two_writes_in_the_same_second_keep_both_backups() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("settings.json");
+        std::fs::write(&path, r#"{"step":0}"#).expect("write");
+
+        let first = file::write(&path, &json!({ "step": 1 }))
+            .expect("write")
+            .expect("backup");
+        let second = file::write(&path, &json!({ "step": 2 }))
+            .expect("write")
+            .expect("backup");
+
+        assert_ne!(first, second, "the older backup must not be clobbered");
+        assert!(
+            std::fs::read_to_string(&first)
+                .expect("read")
+                .contains("\"step\": 0")
+                || std::fs::read_to_string(&first)
+                    .expect("read")
+                    .contains("\"step\":0")
+        );
+        assert!(
+            std::fs::read_to_string(&second)
+                .expect("read")
+                .contains('1')
         );
     }
 

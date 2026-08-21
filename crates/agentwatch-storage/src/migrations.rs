@@ -247,6 +247,45 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         ) STRICT;
     ",
     },
+    Migration {
+        version: 7,
+        name: "repository_linking_and_reconcile_fairness",
+        sql: r"
+        -- Rows are linked to their repository by a backfill pass rather than at
+        -- insert time, because resolution stats the filesystem and the write
+        -- path is not where a stat storm belongs. That only works if finding
+        -- the not-yet-linked rows is free, which is what these partial indexes
+        -- are for: in the steady state they hold nothing at all.
+        CREATE INDEX events_unlinked
+            ON events (project_id) WHERE repository_id IS NULL;
+        CREATE INDEX sessions_unlinked
+            ON sessions (project_id) WHERE repository_id IS NULL;
+        CREATE INDEX token_usage_unlinked
+            ON token_usage (project_id) WHERE repository_id IS NULL;
+
+        -- When a session was last *examined* by the reconciler, as opposed to
+        -- `reconciled_at_us`, which means its transcript will never be read
+        -- again. Sweeping oldest-attempt-first is what stops a bounded sweep
+        -- from re-reading the same newest sessions forever while older ones are
+        -- never reached at all.
+        ALTER TABLE sessions ADD COLUMN reconcile_attempted_at_us INTEGER;
+
+        CREATE INDEX sessions_reconcile_queue
+            ON sessions (reconcile_attempted_at_us) WHERE reconciled_at_us IS NULL;
+    ",
+    },
+    Migration {
+        version: 7,
+        name: "session_surface",
+        sql: r"
+        -- Which surface the agent ran in: Claude Code's `entrypoint`, stored
+        -- verbatim. Nullable because only transcripts carry it — a session seen
+        -- solely through hooks has no surface recorded, and that must read as
+        -- unknown rather than as a default.
+        ALTER TABLE sessions ADD COLUMN surface TEXT;
+        CREATE INDEX sessions_surface ON sessions (surface);
+    ",
+    },
 ];
 
 /// The schema version this build expects.

@@ -42,10 +42,39 @@ const DEBUG_ENV: &str = "AGENTWATCH_HOOK_DEBUG";
 /// where a user would notice. If the daemon is wedged, we drop the event.
 const SOCKET_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// Hard ceiling on the whole forward, whatever it is stuck on.
+///
+/// [`SOCKET_TIMEOUT`] covers the write, but `connect` has no timeout of its own
+/// and blocks if the daemon has stopped accepting with a full backlog. Running
+/// the work on a thread and abandoning it at the deadline is what makes the
+/// bound total rather than per-syscall — without it the one failure mode the
+/// module promises to survive is the one that stalls a tool call.
+const TOTAL_BUDGET: Duration = Duration::from_millis(500);
+
+/// Bytes reserved for the envelope wrapped around the payload.
+///
+/// The frame carries the envelope, not the payload, so the payload limit has to
+/// leave room for the fields around it. Generously over the ~120 bytes it
+/// actually takes, so an oversized payload is refused here with a message that
+/// says so rather than failing later as an opaque write error.
+const ENVELOPE_HEADROOM: usize = 4096;
+
 fn main() {
     // The return value is deliberately discarded: see the module docs.
-    if let Err(error) = forward() {
-        debug(&error);
+    //
+    // The work runs on a thread so a blocked syscall cannot outlive the budget.
+    // Returning from `main` exits the process and takes the thread with it,
+    // which is the point: the agent is waiting on this process, not on us
+    // finishing tidily.
+    let (finished, outcome) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = finished.send(forward());
+    });
+
+    match outcome.recv_timeout(TOTAL_BUDGET) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => debug(&error),
+        Err(_) => debug("timed out; dropping the event"),
     }
 }
 
@@ -79,9 +108,14 @@ fn forward() -> Result<(), String> {
 
 /// Reads the payload, refusing anything that could not be a real hook payload.
 fn read_stdin() -> Result<String, String> {
+    // The frame carries the envelope, so the payload gets the frame limit minus
+    // the room the envelope needs around it. Checking against the frame limit
+    // itself accepts payloads the encoder then rejects.
+    let max_payload = MAX_FRAME_BYTES - ENVELOPE_HEADROOM;
+
     // Read one byte past the limit so an oversized payload is detected rather
     // than silently truncated into invalid JSON.
-    let limit = u64::try_from(MAX_FRAME_BYTES).unwrap_or(u64::MAX);
+    let limit = u64::try_from(max_payload).unwrap_or(u64::MAX);
     let mut buffer = String::new();
     std::io::stdin()
         .lock()
@@ -89,9 +123,9 @@ fn read_stdin() -> Result<String, String> {
         .read_to_string(&mut buffer)
         .map_err(|error| format!("read stdin: {error}"))?;
 
-    if buffer.len() > MAX_FRAME_BYTES {
+    if buffer.len() > max_payload {
         return Err(format!(
-            "payload of {} bytes exceeds the limit",
+            "payload of {} bytes exceeds the {max_payload} byte limit",
             buffer.len()
         ));
     }

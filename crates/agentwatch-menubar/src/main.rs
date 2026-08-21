@@ -10,6 +10,7 @@
 //! who only ever use the command line.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 mod icon;
 mod state;
@@ -24,7 +25,7 @@ use winit::application::ApplicationHandler;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 
 use crate::icon::Glyph;
-use crate::state::Snapshot;
+use crate::state::{Snapshot, Zone};
 
 /// How often the database is re-read.
 ///
@@ -34,10 +35,16 @@ const REFRESH: Duration = Duration::from_secs(2);
 
 fn main() -> Result<()> {
     let paths = Paths::from_env().context("resolving the data directory")?;
+
+    // Before the event loop, deliberately. Reading the local timezone is only
+    // sound while the process is single threaded, and `EventLoop::new` is where
+    // that stops being true.
+    let zone = Zone::resolve();
+
     let event_loop = EventLoop::new().context("creating the event loop")?;
     event_loop.set_control_flow(ControlFlow::WaitUntil(std::time::Instant::now() + REFRESH));
 
-    let mut application = App::new(paths);
+    let mut application = App::new(paths, zone);
     event_loop
         .run_app(&mut application)
         .context("running the event loop")?;
@@ -48,6 +55,8 @@ fn main() -> Result<()> {
 struct App {
     /// Where the data lives.
     paths: Paths,
+    /// The timezone "today" is measured in, resolved at startup.
+    zone: Zone,
     /// The status item, once created.
     tray: Option<tray_icon::TrayIcon>,
     /// Menu entries whose labels are refreshed.
@@ -76,8 +85,9 @@ struct Items {
 
 impl App {
     /// Creates the application.
-    const fn new(paths: Paths) -> Self {
+    const fn new(paths: Paths, zone: Zone) -> Self {
         Self {
+            zone,
             paths,
             tray: None,
             items: None,
@@ -127,7 +137,7 @@ impl App {
 
     /// Re-reads the database and updates the menu if anything moved.
     fn refresh(&mut self) {
-        let snapshot = Snapshot::read(&self.paths);
+        let snapshot = Snapshot::read(&self.paths, self.zone);
         if self.last.as_ref() == Some(&snapshot) {
             return;
         }

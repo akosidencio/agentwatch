@@ -116,7 +116,9 @@ mod tests {
     /// Alpha channel of the rasterized glyph, row-major.
     fn alpha(glyph: Glyph) -> Vec<u8> {
         rasterize(glyph)
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|pixel| pixel[3])
             .collect()
     }
@@ -163,7 +165,7 @@ mod tests {
 
     #[test]
     fn every_pixel_is_black_so_macos_can_recolour_it() {
-        for pixel in rasterize(Glyph::Watching).chunks_exact(4) {
+        for pixel in rasterize(Glyph::Watching).as_chunks::<4>().0 {
             assert_eq!(
                 (pixel[0], pixel[1], pixel[2]),
                 (0, 0, 0),

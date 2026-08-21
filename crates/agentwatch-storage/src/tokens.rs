@@ -43,6 +43,12 @@ pub struct PendingSession {
     pub project_path: Option<String>,
     /// Transcript path the agent reported, when it did.
     pub transcript_path: Option<String>,
+    /// `active`, `ended`, or `unknown`.
+    ///
+    /// Carried so the caller can decide whether a pass is the final one. Only
+    /// an `ended` session is finished for certain; everything else needs the
+    /// transcript itself to say so.
+    pub status: String,
 }
 
 /// One row of a per-group token breakdown.
@@ -220,7 +226,13 @@ impl Store {
         Ok(groups)
     }
 
-    /// Lists sessions whose transcript has not been read yet.
+    /// Lists sessions whose transcript has not been read to completion.
+    ///
+    /// Ordered least-recently-attempted first, not newest first. A sweep is
+    /// bounded, and ordering by start time meant the same newest sessions were
+    /// re-read on every pass while everything behind them was never reached at
+    /// all — which is the normal state after importing a history, since a
+    /// session nobody watched start cannot be declared finished on sight.
     ///
     /// # Errors
     ///
@@ -230,12 +242,13 @@ impl Store {
         limit: u32,
     ) -> Result<Vec<PendingSession>, StoreError> {
         let mut statement = self.connection().prepare(
-            "SELECT s.id, s.external_session_id, s.agent_id, p.path, s.transcript_path
+            "SELECT s.id, s.external_session_id, s.agent_id, p.path, s.transcript_path, s.status
                FROM sessions s
                LEFT JOIN projects p ON p.id = s.project_id
               WHERE s.reconciled_at_us IS NULL
                 AND s.external_session_id IS NOT NULL
-              ORDER BY s.started_at_us DESC
+              ORDER BY COALESCE(s.reconcile_attempted_at_us, 0) ASC,
+                       s.started_at_us DESC
               LIMIT ?1",
         )?;
 
@@ -246,6 +259,7 @@ impl Store {
                 agent_id: row.get(2)?,
                 project_path: row.get(3)?,
                 transcript_path: row.get(4)?,
+                status: row.get(5)?,
             })
         })?;
 
@@ -256,17 +270,37 @@ impl Store {
         Ok(sessions)
     }
 
-    /// Records that a session's transcript has been read to completion.
+    /// Records that a session's transcript will never need reading again.
     ///
-    /// Only meaningful for ended sessions: an active session's transcript is
-    /// still growing, so marking it done would freeze its totals mid-flight.
+    /// Final: the session drops out of the reconcile queue permanently, so the
+    /// caller must be sure the transcript has stopped growing. Whether that is
+    /// true is a question about the transcript, not about the row, so the
+    /// decision belongs to the caller holding the file.
     ///
     /// # Errors
     ///
     /// Returns an error if the update fails.
     pub fn mark_reconciled(&self, session_id: &str, at_us: i64) -> Result<(), StoreError> {
         self.connection().execute(
-            "UPDATE sessions SET reconciled_at_us = ?2 WHERE id = ?1 AND status = 'ended'",
+            "UPDATE sessions
+                SET reconciled_at_us = ?2, reconcile_attempted_at_us = ?2
+              WHERE id = ?1",
+            params![session_id, at_us],
+        )?;
+        Ok(())
+    }
+
+    /// Records that a session was examined without being finished.
+    ///
+    /// What moves a session to the back of the queue, so a bounded sweep works
+    /// its way through every pending session rather than circling the newest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    pub fn mark_reconcile_attempted(&self, session_id: &str, at_us: i64) -> Result<(), StoreError> {
+        self.connection().execute(
+            "UPDATE sessions SET reconcile_attempted_at_us = ?2 WHERE id = ?1",
             params![session_id, at_us],
         )?;
         Ok(())
@@ -459,11 +493,30 @@ mod tests {
     }
 
     #[test]
-    fn an_active_session_cannot_be_marked_reconciled() {
+    fn marking_a_session_reconciled_retires_it() {
         let store = seeded();
         let pending = store.sessions_awaiting_reconcile(10).expect("pending");
         store
             .mark_reconciled(&pending[0].session_id, 1)
+            .expect("mark");
+
+        assert!(
+            store
+                .sessions_awaiting_reconcile(10)
+                .expect("pending")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn recording_an_attempt_keeps_a_session_pending() {
+        // The counterpart to `mark_reconciled`: whether a transcript has
+        // stopped growing is a question about the file, so the reconciler
+        // decides and this only moves the session down the queue.
+        let store = seeded();
+        let pending = store.sessions_awaiting_reconcile(10).expect("pending");
+        store
+            .mark_reconcile_attempted(&pending[0].session_id, 1)
             .expect("mark");
 
         assert_eq!(
@@ -472,7 +525,28 @@ mod tests {
                 .expect("pending")
                 .len(),
             1,
-            "an active session's transcript is still growing"
+            "an examined session is not necessarily a finished one"
+        );
+    }
+
+    #[test]
+    fn the_queue_serves_the_least_recently_attempted_first() {
+        let store = seeded();
+        let mut store = store;
+        store
+            .insert_events(&[usage("m4", 4_000_000, 400, "/work/other")
+                .with_session(ExternalSessionId::from("s-2".to_owned()))])
+            .expect("insert");
+
+        let first = store.sessions_awaiting_reconcile(1).expect("pending");
+        store
+            .mark_reconcile_attempted(&first[0].session_id, 10)
+            .expect("mark");
+
+        let second = store.sessions_awaiting_reconcile(1).expect("pending");
+        assert_ne!(
+            second[0].session_id, first[0].session_id,
+            "a bounded sweep must not circle the same head forever"
         );
     }
 }

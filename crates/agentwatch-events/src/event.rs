@@ -29,6 +29,14 @@ pub struct AgentEvent {
     /// because that is the only thing an adapter emits. Storage folds it onto
     /// the session row.
     pub git_branch: Option<String>,
+    /// Which surface the agent was running in, when it reports one.
+    ///
+    /// Claude Code calls this the `entrypoint` and writes values like
+    /// `claude-vscode`. Stored verbatim rather than mapped onto an enum of our
+    /// own: a value we have never seen should show up as itself, not collapse
+    /// into `Other`. Session context, folded onto the session row like
+    /// [`Self::git_branch`].
+    pub surface: Option<String>,
     /// How this event was obtained.
     pub evidence: EvidenceSource,
     /// How much to trust it.
@@ -50,6 +58,7 @@ impl AgentEvent {
             project_id: None,
             project_path: None,
             git_branch: None,
+            surface: None,
             evidence,
             confidence: Confidence::CERTAIN,
             event,
@@ -86,6 +95,13 @@ impl AgentEvent {
     #[must_use]
     pub fn with_git_branch(mut self, branch: Option<String>) -> Self {
         self.git_branch = branch;
+        self
+    }
+
+    /// Records which surface the agent was running in.
+    #[must_use]
+    pub fn with_surface(mut self, surface: Option<String>) -> Self {
+        self.surface = surface;
         self
     }
 
@@ -160,10 +176,14 @@ pub enum Event {
 }
 
 impl Event {
-    /// The stable kind string stored in the database.
+    /// The stable kind string stored in the database's `kind` column.
     ///
-    /// Kept in sync by hand with the serde renames above so that the column and
-    /// the JSON payload always agree.
+    /// Matches the serde tag above for every variant *except* `Collection`,
+    /// which is deliberately split into `collection.paused` and
+    /// `collection.resumed`. The column is what queries filter and group on, so
+    /// a distinction worth filtering by belongs in it; the payload still
+    /// carries the flag, so nothing is lost either way. Kept in sync by hand,
+    /// and pinned by the tests below.
     #[must_use]
     pub const fn kind(&self) -> &'static str {
         match self {
@@ -388,6 +408,8 @@ mod tests {
             Event::ToolCall(ToolCallEvent {
                 tool: "Glob".into(),
             }),
+            Event::TokenUsage(TokenUsageEvent::default()),
+            Event::ConfigChanged(ConfigChangedEvent::default()),
             Event::Unknown(UnknownEvent {
                 label: "Notification".into(),
             }),
@@ -397,6 +419,30 @@ mod tests {
             let json = serde_json::to_value(&event).expect("serializable");
             let tag = json.get("kind").and_then(serde_json::Value::as_str);
             assert_eq!(tag, Some(event.kind()), "tag and kind() disagree");
+        }
+    }
+
+    #[test]
+    fn collection_is_the_one_kind_finer_than_its_tag() {
+        // Deliberate, not an oversight: the column distinguishes pausing from
+        // resuming so a query can filter on it, while the payload carries the
+        // flag either way. Asserted so the divergence stays a decision.
+        for (paused, expected) in [(true, "collection.paused"), (false, "collection.resumed")] {
+            let event = Event::Collection(CollectionEvent { paused });
+            assert_eq!(event.kind(), expected);
+
+            let json = serde_json::to_value(&event).expect("serializable");
+            assert_eq!(
+                json.get("kind").and_then(serde_json::Value::as_str),
+                Some("collection"),
+                "the payload tag stays coarse so it round-trips"
+            );
+
+            let decoded: Event = serde_json::from_value(json).expect("deserializable");
+            assert_eq!(
+                decoded, event,
+                "the finer column must not cost a round trip"
+            );
         }
     }
 

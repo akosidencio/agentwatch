@@ -37,23 +37,36 @@ impl Store {
         to_us: i64,
         limit: u32,
     ) -> Result<Vec<Notable>, StoreError> {
+        // Ordered by explicit rank, never by the stored string. Sorting the
+        // label alphabetically puts `sensitive` above `normal` above
+        // `highly_sensitive`, which is worse than useless here: with a limit in
+        // play the private keys are the rows that fall off the end.
         let mut statement = self.connection().prepare(
-            "SELECT f.timestamp_us, f.sensitivity, f.operation, f.path, 'hook',
-                COALESCE(r.root, p.path)
-           FROM file_events f
-           LEFT JOIN projects p     ON p.id = f.project_id
-           LEFT JOIN repositories r ON r.id = p.repository_id
-          WHERE f.sensitivity != 'normal'
-            AND f.timestamp_us >= ?1 AND f.timestamp_us < ?2
-         UNION ALL
-         SELECT c.timestamp_us, c.sensitivity, 'command', c.path, 'derived',
-                COALESCE(r.root, p.path)
-           FROM command_path_references c
-           LEFT JOIN projects p     ON p.id = c.project_id
-           LEFT JOIN repositories r ON r.id = p.repository_id
-          WHERE c.sensitivity != 'normal'
-            AND c.timestamp_us >= ?1 AND c.timestamp_us < ?2
-          ORDER BY 2 DESC, 1 DESC
+            "SELECT timestamp_us, sensitivity, kind, path, evidence, project
+           FROM (
+             SELECT f.timestamp_us AS timestamp_us, f.sensitivity AS sensitivity,
+                    f.operation AS kind, f.path AS path, 'hook' AS evidence,
+                    COALESCE(r.root, p.path) AS project
+               FROM file_events f
+               LEFT JOIN projects p     ON p.id = f.project_id
+               LEFT JOIN repositories r ON r.id = p.repository_id
+              WHERE f.sensitivity != 'normal'
+                AND f.timestamp_us >= ?1 AND f.timestamp_us < ?2
+             UNION ALL
+             SELECT c.timestamp_us, c.sensitivity, 'command', c.path, 'derived',
+                    COALESCE(r.root, p.path)
+               FROM command_path_references c
+               LEFT JOIN projects p     ON p.id = c.project_id
+               LEFT JOIN repositories r ON r.id = p.repository_id
+              WHERE c.sensitivity != 'normal'
+                AND c.timestamp_us >= ?1 AND c.timestamp_us < ?2
+           )
+          ORDER BY CASE sensitivity
+                     WHEN 'highly_sensitive' THEN 2
+                     WHEN 'sensitive'        THEN 1
+                     ELSE 0
+                   END DESC,
+                   timestamp_us DESC
           LIMIT ?3",
         )?;
 
@@ -119,12 +132,20 @@ mod tests {
     #[test]
     fn orders_most_serious_first() {
         let found = seeded().notable_access(0, i64::MAX, 50).expect("query");
-        assert_eq!(found[0].sensitivity, "sensitive");
-        assert!(
-            found
-                .iter()
-                .any(|row| row.sensitivity == "highly_sensitive")
+        assert_eq!(
+            found[0].sensitivity, "highly_sensitive",
+            "a private key outranks a dotenv"
         );
+        assert_eq!(found[1].sensitivity, "sensitive");
+    }
+
+    #[test]
+    fn a_limit_keeps_the_most_serious_rather_than_the_alphabetical_first() {
+        // The regression: ordering by the stored label sorts `sensitive` above
+        // `highly_sensitive`, so a limit dropped exactly the rows worth seeing.
+        let found = seeded().notable_access(0, i64::MAX, 1).expect("query");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].sensitivity, "highly_sensitive");
     }
 
     #[test]

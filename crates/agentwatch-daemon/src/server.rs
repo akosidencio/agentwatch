@@ -7,6 +7,7 @@ use tokio::io::AsyncReadExt as _;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
 use tokio::sync::mpsc::Sender;
+use tokio::task::JoinSet;
 
 use crate::registry::AdapterRegistry;
 
@@ -14,29 +15,45 @@ use crate::registry::AdapterRegistry;
 ///
 /// A connection carrying a bad frame is dropped rather than reset, on the
 /// assumption that a confused hook should not be able to take down ingestion.
+///
+/// Connections are held in a [`JoinSet`] owned by this task rather than spawned
+/// loose. Each one holds a clone of the event sender, so a connection that
+/// outlives shutdown keeps the pipeline's channel open and the batcher waiting
+/// on it forever. Dropping the set when this task is aborted takes every
+/// in-flight connection with it, which is what lets the channel actually close.
 pub(crate) async fn serve(
     listener: UnixListener,
     registry: Arc<AdapterRegistry>,
     events: Sender<AgentEvent>,
     session_ended: Arc<Notify>,
 ) {
-    loop {
-        let stream = match listener.accept().await {
-            Ok((stream, _address)) => stream,
-            Err(error) => {
-                tracing::error!(?error, "accept failed");
-                continue;
-            }
-        };
+    let mut connections = JoinSet::new();
 
-        let registry = Arc::clone(&registry);
-        let events = events.clone();
-        let session_ended = Arc::clone(&session_ended);
-        tokio::spawn(async move {
-            if let Err(error) = handle(stream, &registry, &events, &session_ended).await {
-                tracing::debug!(?error, "connection ended");
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let stream = match accepted {
+                    Ok((stream, _address)) => stream,
+                    Err(error) => {
+                        tracing::error!(?error, "accept failed");
+                        continue;
+                    }
+                };
+
+                let registry = Arc::clone(&registry);
+                let events = events.clone();
+                let session_ended = Arc::clone(&session_ended);
+                connections.spawn(async move {
+                    if let Err(error) = handle(stream, &registry, &events, &session_ended).await {
+                        tracing::debug!(?error, "connection ended");
+                    }
+                });
             }
-        });
+
+            // Reaps finished connections so the set does not grow without
+            // bound over the life of the daemon.
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
+        }
     }
 }
 

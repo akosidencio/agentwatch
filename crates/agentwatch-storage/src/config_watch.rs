@@ -36,14 +36,18 @@ impl Store {
         fingerprint: &str,
         hooks_present: bool,
     ) -> Result<ConfigCheck, StoreError> {
-        let previous: Option<(String, bool)> = self
-            .connection()
-            .query_row(
-                "SELECT fingerprint, hooks_present FROM config_watch WHERE path = ?1",
-                params![path],
-                |row| Ok((row.get(0)?, row.get::<_, i64>(1)? != 0)),
-            )
-            .ok();
+        // A genuine query failure is raised, not folded into "never seen
+        // before": reporting a broken database as first sight would silently
+        // swallow the one change this exists to announce.
+        let previous: Option<(String, bool)> = match self.connection().query_row(
+            "SELECT fingerprint, hooks_present FROM config_watch WHERE path = ?1",
+            params![path],
+            |row| Ok((row.get(0)?, row.get::<_, i64>(1)? != 0)),
+        ) {
+            Ok(row) => Some(row),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(error) => return Err(error.into()),
+        };
 
         let now = agentwatch_types::Timestamp::now().as_micros();
         self.connection().execute(

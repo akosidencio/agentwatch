@@ -15,6 +15,12 @@ pub struct SessionRow {
     pub project: Option<String>,
     /// Git branch, when known.
     pub git_branch: Option<String>,
+    /// Surface the agent ran in, when known — `claude-vscode`, and so on.
+    ///
+    /// `None` means it was never observed, not that it was a default: only
+    /// transcripts carry the field, so a session seen purely through hooks has
+    /// no surface until it is reconciled.
+    pub surface: Option<String>,
     /// When it started.
     pub started_at_us: Option<i64>,
     /// How long it ran, if it has ended.
@@ -92,6 +98,7 @@ impl Store {
                     s.agent_id,
                     COALESCE(r.root, p.path),
                     s.git_branch,
+                    s.surface,
                     s.started_at_us,
                     s.duration_ms,
                     s.status,
@@ -121,15 +128,16 @@ impl Store {
                 agent_id: row.get(1)?,
                 project: row.get(2)?,
                 git_branch: row.get(3)?,
-                started_at_us: row.get(4)?,
-                duration_ms: row.get(5)?,
-                status: row.get(6)?,
-                tokens: row.get(7)?,
-                responses: row.get(8)?,
-                commands: row.get(9)?,
-                files: row.get(10)?,
-                mcp_calls: row.get(11)?,
-                sensitive: row.get(12)?,
+                surface: row.get(4)?,
+                started_at_us: row.get(5)?,
+                duration_ms: row.get(6)?,
+                status: row.get(7)?,
+                tokens: row.get(8)?,
+                responses: row.get(9)?,
+                commands: row.get(10)?,
+                files: row.get(11)?,
+                mcp_calls: row.get(12)?,
+                sensitive: row.get(13)?,
             })
         })?;
 

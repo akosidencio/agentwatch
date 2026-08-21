@@ -28,6 +28,12 @@ const INGEST_QUEUE_DEPTH: usize = 4096;
 /// we never saw, which is exactly the case a nudge cannot cover.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
 
+/// Longest to wait for queued events to be written during shutdown.
+///
+/// Comfortably more than a full write queue needs, and short enough that
+/// stopping the service stays a quick operation whatever state it was in.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
 /// How long to wait after a session ends before reading its transcript.
 ///
 /// The agent writes the last records around the same moment the hook fires;
@@ -124,12 +130,22 @@ impl Daemon {
         shutdown_signal().await;
         tracing::info!("shutting down; flushing queued events");
 
-        // Aborting the server closes the last `Sender`, which ends the batcher
-        // once it has drained and written whatever was already queued.
+        // Aborting the server drops its connection set and with it the last
+        // `Sender`, which ends the batcher once it has drained and written
+        // whatever was already queued.
         reconciler.abort();
         server.abort();
-        if let Err(error) = batcher.await {
-            tracing::error!(?error, "batcher did not shut down cleanly");
+
+        // Bounded, because this runs between the user asking us to stop and the
+        // process exiting. Draining is worth waiting for; waiting forever on a
+        // stage that will not finish is not, and launchd will kill us anyway.
+        match tokio::time::timeout(SHUTDOWN_GRACE, batcher).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::error!(?error, "batcher did not shut down cleanly"),
+            Err(_) => tracing::warn!(
+                grace = ?SHUTDOWN_GRACE,
+                "batcher did not drain in time; exiting anyway"
+            ),
         }
 
         let _ = std::fs::remove_file(paths.socket());

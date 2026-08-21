@@ -44,7 +44,11 @@ impl Sensitivity {
 const HIGHLY_SENSITIVE_DIRECTORIES: [&str; 4] = [".ssh", ".gnupg", ".aws", ".docker"];
 
 /// Directory segments holding credentialed configuration.
-const SENSITIVE_DIRECTORIES: [&str; 3] = [".kube", "gcloud", ".config/gcloud"];
+///
+/// Single segments only: matching is per path component, so a multi-component
+/// entry like `.config/gcloud` could never fire. `gcloud` covers it wherever it
+/// sits, which is the behaviour that entry was reaching for.
+const SENSITIVE_DIRECTORIES: [&str; 2] = [".kube", "gcloud"];
 
 /// Extensions that are key material regardless of where they live.
 const HIGHLY_SENSITIVE_EXTENSIONS: [&str; 6] = ["pem", "key", "p12", "pfx", "jks", "keystore"];
@@ -199,6 +203,21 @@ mod tests {
             classify("/Users/dev/.config/gcloud/application_default_credentials.json"),
             Sensitivity::Sensitive
         );
+    }
+
+    #[test]
+    fn every_directory_rule_is_a_single_path_segment() {
+        // A multi-component entry silently never matches, because matching is
+        // per segment. Cheaper to assert than to notice a dead rule later.
+        for segment in HIGHLY_SENSITIVE_DIRECTORIES
+            .iter()
+            .chain(SENSITIVE_DIRECTORIES.iter())
+        {
+            assert!(
+                !segment.contains('/'),
+                "`{segment}` can never match a single path segment"
+            );
+        }
     }
 
     #[test]

@@ -289,12 +289,6 @@ Claude Code on macOS, local only. 267 tests, clippy clean.
 - [ ] **Policy engine / rules file** — there is nothing to enforce yet.
 - [ ] **Web dashboard** — largest cost in the original spec, least informative about demand. The CLI answers the same question and the TUI covers the live case for a fraction of the cost.
 
-### Not planned
-
-- **Homebrew, `cargo install`, npm, Nix** — [one channel, one artifact, one version](#why-curl-is-the-only-supported-install).
-- **Network monitoring** — traffic is not attributable to a PID without a Network Extension, so it cannot be delivered honestly.
-- **Process tree sampling** — polling misses short-lived children and fights the idle-CPU target.
-- **Any hosted or cloud component** — no accounts, no sync, no telemetry. The absence is the product.
 
 ## FAQ
 
@@ -306,9 +300,6 @@ The hook adds a measured ~7ms median per tool call, and that cost is process spa
 
 **Can it read my prompts or my code?**
 No. Prompts are reduced to a character count and a hash at the adapter boundary, and tool responses are never deserialized. Shell command lines are stored in full, deliberately.
-
-**Can I install it with Homebrew or `cargo install`?**
-No, and that is not an oversight — see [why curl is the only supported install](#why-curl-is-the-only-supported-install).
 
 **Does it work with Cursor, Codex, Copilot, or Gemini?**
 Not yet. Claude Code only. The adapter trait exists so agent #2 is a week of work rather than a rewrite.

@@ -120,3 +120,36 @@ fn stays_inside_the_latency_budget_when_the_daemon_is_absent() {
         "worst hook round trip was {slowest:?}, budget is {LATENCY_BUDGET:?}"
     );
 }
+
+#[test]
+fn exits_promptly_when_the_daemon_accepts_but_never_reads() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let socket = directory.path().join("agentwatch.sock");
+
+    // Bound, accept nothing. Connections queue in the backlog and no read ever
+    // drains them, which is what a wedged daemon looks like from out here.
+    let _listener = UnixListener::bind(&socket).expect("bind");
+
+    let started = Instant::now();
+    let status = run_hook(directory.path(), PAYLOAD);
+    let elapsed = started.elapsed();
+
+    assert!(
+        status.success(),
+        "a wedged daemon must not fail a tool call"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "hook took {elapsed:?} against a daemon that never reads"
+    );
+}
+
+#[test]
+fn exits_zero_on_an_oversized_payload() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let huge = format!(
+        r#"{{"hook_event_name":"x","prompt":"{}"}}"#,
+        "a".repeat(2 << 20)
+    );
+    assert!(run_hook(directory.path(), &huge).success());
+}

@@ -141,9 +141,39 @@ impl Store {
 }
 
 /// Writes a single event and the identity rows it implies.
+///
+/// The spine row goes in first, and its result decides whether the rest runs.
+/// An event id that is already stored means every row this event implies was
+/// written by the same transaction that stored it, so a replay — a crashed
+/// batch, a second reconcile pass over the same transcript — costs one
+/// statement rather than five per event and cannot re-apply a session's
+/// lifecycle updates on top of themselves.
 fn insert_one(transaction: &Transaction<'_>, event: &AgentEvent) -> Result<usize, StoreError> {
     let now = Timestamp::now().as_micros();
     let timestamp = event.timestamp.as_micros();
+
+    let payload = serde_json::to_string(&event.event)?;
+    let inserted = transaction.execute(
+        "INSERT OR IGNORE INTO events
+            (id, timestamp_us, agent_id, session_id, project_id, kind, evidence, confidence, payload, created_at_us)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            event.id.to_string(),
+            timestamp,
+            event.agent_id.as_str(),
+            event.session_id.map(|id| id.to_string()),
+            event.project_id.map(|id| id.to_string()),
+            event.kind(),
+            event.evidence.as_str(),
+            f64::from(event.confidence.value()),
+            payload,
+            now,
+        ],
+    )?;
+
+    if inserted == 0 {
+        return Ok(0);
+    }
 
     transaction.execute(
         "INSERT INTO agents (id, first_seen_us, last_seen_us)
@@ -166,25 +196,6 @@ fn insert_one(transaction: &Transaction<'_>, event: &AgentEvent) -> Result<usize
     }
 
     write_projection(transaction, event, now)?;
-
-    let payload = serde_json::to_string(&event.event)?;
-    let inserted = transaction.execute(
-        "INSERT OR IGNORE INTO events
-            (id, timestamp_us, agent_id, session_id, project_id, kind, evidence, confidence, payload, created_at_us)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![
-            event.id.to_string(),
-            timestamp,
-            event.agent_id.as_str(),
-            event.session_id.map(|id| id.to_string()),
-            event.project_id.map(|id| id.to_string()),
-            event.kind(),
-            event.evidence.as_str(),
-            f64::from(event.confidence.value()),
-            payload,
-            now,
-        ],
-    )?;
 
     Ok(inserted)
 }
@@ -381,13 +392,14 @@ fn upsert_session(
 
     transaction.execute(
         "INSERT INTO sessions
-            (id, agent_id, external_session_id, project_id, started_at_us, status, transcript_path, created_at_us, git_branch)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?9, ?6, ?7, ?8)
+            (id, agent_id, external_session_id, project_id, started_at_us, status, transcript_path, created_at_us, git_branch, surface)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?9, ?6, ?7, ?8, ?10)
          ON CONFLICT(id) DO UPDATE SET
             started_at_us   = MIN(COALESCE(started_at_us, excluded.started_at_us), excluded.started_at_us),
             project_id      = COALESCE(sessions.project_id, excluded.project_id),
             transcript_path = COALESCE(excluded.transcript_path, sessions.transcript_path),
             git_branch      = COALESCE(excluded.git_branch, sessions.git_branch),
+            surface         = COALESCE(excluded.surface, sessions.surface),
             status          = CASE
                                 WHEN sessions.status = 'unknown' THEN excluded.status
                                 ELSE sessions.status
@@ -402,6 +414,7 @@ fn upsert_session(
             now,
             event.git_branch.as_deref(),
             status,
+            event.surface.as_deref(),
         ],
     )?;
 
@@ -722,6 +735,50 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM mcp_events", [], |row| row.get(0))
             .expect("query");
         assert_eq!((commands, calls), (1, 1));
+    }
+
+    #[test]
+    fn the_session_absorbs_the_surface() {
+        let mut store = Store::open_in_memory().expect("schema");
+        let event = command_event("s-1").with_surface(Some("claude-vscode".to_owned()));
+        store.insert_events(&[event]).expect("insert");
+
+        let surface: Option<String> = store
+            .connection()
+            .query_row("SELECT surface FROM sessions", [], |row| row.get(0))
+            .expect("query");
+        assert_eq!(surface.as_deref(), Some("claude-vscode"));
+    }
+
+    #[test]
+    fn a_session_seen_only_through_hooks_has_no_surface() {
+        let mut store = Store::open_in_memory().expect("schema");
+        store
+            .insert_events(&[command_event("s-1")])
+            .expect("insert");
+
+        let surface: Option<String> = store
+            .connection()
+            .query_row("SELECT surface FROM sessions", [], |row| row.get(0))
+            .expect("query");
+        assert_eq!(surface, None, "unknown must not be filled in with a guess");
+    }
+
+    #[test]
+    fn a_later_event_without_a_surface_does_not_erase_the_known_one() {
+        let mut store = Store::open_in_memory().expect("schema");
+        store
+            .insert_events(&[
+                command_event("s-1").with_surface(Some("claude-vscode".to_owned())),
+                command_event("s-1"),
+            ])
+            .expect("insert");
+
+        let surface: Option<String> = store
+            .connection()
+            .query_row("SELECT surface FROM sessions", [], |row| row.get(0))
+            .expect("query");
+        assert_eq!(surface.as_deref(), Some("claude-vscode"));
     }
 
     #[test]
