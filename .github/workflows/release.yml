@@ -108,13 +108,17 @@ jobs:
           cd target/${{ matrix.target }}/release
           ./agentwatch --version
           ./agentwatch --help > /dev/null
+          # A bare invocation is the welcome screen, and the installer prints
+          # it by running the binary it just installed. If it ever exits
+          # non-zero, `curl | sh` ends on an error.
+          ./agentwatch > /dev/null
           # The hook must exit 0 even with no daemon listening. If that ever
           # stops being true it fails a real tool call, so it is checked on
           # the artifact itself, not only in the test suite.
-          if echo '{}' | ./agentwatch-hook; then
+          if echo '{}' | ./agentwatch hook; then
             echo "hook exited 0 with no daemon listening"
           else
-            echo "::error::agentwatch-hook exited non-zero with no daemon"
+            echo "::error::agentwatch hook exited non-zero with no daemon"
             exit 1
           fi
           # The menu bar takes no flags and blocks in an event loop, so it is
@@ -128,9 +132,13 @@ jobs:
           archive="agentwatch-${{ matrix.target }}.tar.gz"
           # Binaries sit at the archive root, so `tar xz -C ~/.local/bin`
           # puts them straight onto PATH with no stray directory.
+          # Two binaries, not four: the collector and the hook are subcommands
+          # of `agentwatch` now. The status item stays separate because linking
+          # AppKit into the executable the hook spawns costs ~4 ms on every
+          # tool call — measured, and the reason for the split.
           tar -czf "$archive" \
             -C target/${{ matrix.target }}/release \
-            agentwatch agentwatch-daemon agentwatch-hook agentwatch-menubar
+            agentwatch agentwatch-menubar
           shasum -a 256 "$archive" > "$archive.sha256"
           echo "--- $archive ---"
           tar -tzf "$archive"
@@ -190,11 +198,12 @@ jobs:
           curl -fsSL https://github.com/${{ github.repository }}/releases/download/${TAG}/install.sh | sh
           \`\`\`
 
-          Then:
+          Then one command sets everything up — hooks, the collector, the menu
+          bar, and the history Claude Code has already written. It shows the
+          whole plan and asks once before writing anything.
 
           \`\`\`sh
-          agentwatch install-hooks
-          agentwatch service install
+          agentwatch init
           \`\`\`
 
           macOS only. The binaries are unsigned; \`curl\` does not set the

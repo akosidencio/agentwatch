@@ -57,10 +57,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Excluded from default-members, so `cargo clippy --all-targets` above
-      # never sees it. Without this job it would rot unnoticed.
+      # Excluded from default-members — it is the one binary that is not part
+      # of `agentwatch` — so `cargo clippy --all-targets` above never sees it.
+      # Without this job it would rot unnoticed.
       - name: Clippy
         run: cargo clippy -p agentwatch-menubar --all-targets -- -D warnings
 
       - name: Build
-        run: cargo build -p agentwatch-menubar
+        run: cargo build -p agentwatch-menubar --all-targets

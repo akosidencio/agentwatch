@@ -6,6 +6,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 mod hook_config;
+mod init;
 mod install;
 mod range;
 mod render;
@@ -13,6 +14,7 @@ mod service;
 mod sync;
 mod theme;
 mod watch;
+mod welcome;
 
 use std::path::PathBuf;
 
@@ -30,8 +32,12 @@ use clap::{Parser, Subcommand};
 )]
 struct Cli {
     /// What to do.
+    ///
+    /// Optional: a bare `agentwatch` is a welcome screen rather than a usage
+    /// error, because the first thing most people type after installing
+    /// something is its name.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 /// How to group a token breakdown.
@@ -52,9 +58,12 @@ enum Grouping {
 enum ServiceAction {
     /// Install and start the LaunchAgent.
     Install {
-        /// Path to the daemon binary.
+        /// Path to the binary the job runs.
         #[arg(long)]
         binary: Option<PathBuf>,
+        /// Act on the menu bar status item instead of the collector.
+        #[arg(long)]
+        menu_bar: bool,
         /// Show the job definition and exit without writing.
         #[arg(long)]
         dry_run: bool,
@@ -63,14 +72,36 @@ enum ServiceAction {
         yes: bool,
     },
     /// Stop and remove the LaunchAgent.
-    Uninstall,
-    /// Report whether the service is installed and loaded.
+    Uninstall {
+        /// Act on the menu bar status item instead of the collector.
+        #[arg(long)]
+        menu_bar: bool,
+    },
+    /// Report whether each job is installed and loaded.
     Status,
 }
 
 /// The available commands.
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Set everything up: hooks, the background service, and existing history.
+    ///
+    /// Shows the whole plan and asks once. Safe to re-run: steps already done
+    /// are skipped, so this doubles as the repair command after an upgrade.
+    Init {
+        /// Show the plan and exit without writing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Set up without asking.
+        #[arg(long, short)]
+        yes: bool,
+        /// Leave the menu bar status item out.
+        #[arg(long)]
+        no_menu_bar: bool,
+        /// Skip reading the history Claude Code has already written.
+        #[arg(long)]
+        no_import: bool,
+    },
     /// Show whether the daemon is running and what it has collected.
     Status,
     /// List the most recent events.
@@ -102,7 +133,7 @@ enum Command {
     },
     /// Add our hooks to the agent's settings, after showing the diff.
     InstallHooks {
-        /// Path to the hook binary to register.
+        /// Path to the agentwatch executable to register.
         #[arg(long)]
         binary: Option<PathBuf>,
         /// Settings file to edit.
@@ -194,22 +225,67 @@ enum Command {
     },
     /// Re-derive totals from the transcripts and report any disagreement.
     Verify,
+    /// Run the collector in the foreground.
+    ///
+    /// `agentwatch service install` runs this under launchd, which is what you
+    /// normally want. Run it directly to watch it work, or to see why it will
+    /// not start.
+    Daemon,
+    /// Forward one hook payload from stdin to the collector.
+    ///
+    /// The agent runs this, not you: it is the command `install-hooks` writes
+    /// into your settings. It reads a JSON payload on stdin and exits 0 on
+    /// every path, whatever goes wrong, because a monitor that can fail a tool
+    /// call is worse than no monitor.
+    #[command(hide = true)]
+    Hook,
     /// Print the settings needed to enable monitoring.
     ///
     /// Prints only. Nothing is written to your Claude Code configuration; copy
     /// the output yourself, or wait for `install-hooks` in phase 4.
     HookConfig {
-        /// Path to the hook binary to reference.
+        /// Path to the agentwatch executable to reference.
         #[arg(long)]
         binary: Option<String>,
     },
 }
 
 fn main() -> Result<()> {
+    // The hook is dispatched before clap, and before anything else that can
+    // fail. It runs in the agent's critical path and must exit 0 on every path;
+    // clap exits 2 on an argument it does not recognise, and resolving the data
+    // directory can fail outright. The hook resolves its own paths and swallows
+    // its own failures, so it needs neither.
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|first| first == "hook")
+    {
+        return hook();
+    }
+
     let cli = Cli::parse();
     let paths = Paths::from_env().context("resolving the data directory")?;
 
-    match cli.command {
+    let Some(command) = cli.command else {
+        welcome::overview(&paths);
+        return Ok(());
+    };
+
+    match command {
+        Command::Init {
+            dry_run,
+            yes,
+            no_menu_bar,
+            no_import,
+        } => init::run(
+            &paths,
+            init::Options {
+                assume_yes: yes,
+                dry_run,
+                menu_bar: !no_menu_bar,
+                import: !no_import,
+            },
+        ),
         Command::Status => status(&paths),
         Command::Events { limit } => events(&paths, limit),
         Command::Tokens {
@@ -258,11 +334,34 @@ fn main() -> Result<()> {
         Command::Export { days, limit, kind } => export(&paths, days, limit, kind),
         Command::Import { limit } => import(&paths, limit),
         Command::Verify => verify(&paths),
+        Command::Daemon => agentwatch_daemon::run(),
+        // Unreachable in practice: `main` intercepts this before clap runs.
+        // Kept so the dispatch matches the command list rather than relying on
+        // the fast path being the only way in.
+        Command::Hook => hook(),
         Command::HookConfig { binary } => {
             print!("{}", hook_config::snippet(binary.as_deref()));
             Ok(())
         }
     }
+}
+
+/// Forwards one hook payload, and never fails doing it.
+fn hook() -> Result<()> {
+    use std::io::IsTerminal as _;
+
+    // Typed by a human, this would otherwise block on a terminal forever
+    // waiting for a payload nobody is going to type.
+    if std::io::stdin().is_terminal() {
+        eprintln!(
+            "`agentwatch hook` reads a hook payload on stdin. The agent runs it \
+             for you — see `agentwatch init`."
+        );
+        return Ok(());
+    }
+
+    agentwatch_hook::run();
+    Ok(())
 }
 
 /// Prints daemon liveness and headline counts.
@@ -461,45 +560,46 @@ fn set_paused(paths: &Paths, paused: bool) -> Result<()> {
     Ok(())
 }
 
-/// Installs, removes, or reports on the background service.
+/// Installs, removes, or reports on the background jobs.
 fn service_command(paths: &Paths, action: ServiceAction) -> Result<()> {
-    let path = service::plist_path();
-
     match action {
+        // Both jobs, always: someone checking why the icon is gone should not
+        // have to know there is a second job or a flag to ask about it.
         ServiceAction::Status => {
-            println!("Job label:  {}", service::LABEL);
-            println!("Definition: {}", path.display());
-            println!("Installed:  {}", if path.exists() { "yes" } else { "no" });
-            println!(
-                "Loaded:     {}",
-                if service::is_loaded() { "yes" } else { "no" }
-            );
-            if !path.exists() {
-                println!("\nRun `agentwatch service install` to start it at login.");
+            for job in service::JOBS {
+                let path = service::plist_path(job);
+                println!("{} ({})", job.label(), job.description());
+                println!("  Definition: {}", path.display());
+                println!("  Installed:  {}", if path.exists() { "yes" } else { "no" });
+                println!(
+                    "  Loaded:     {}",
+                    if service::is_loaded(job) { "yes" } else { "no" }
+                );
+                if !path.exists() {
+                    let flag = if job == service::Job::MenuBar {
+                        " --menu-bar"
+                    } else {
+                        ""
+                    };
+                    println!("  Run `agentwatch service install{flag}` to start it at login.");
+                }
             }
             Ok(())
         }
 
         ServiceAction::Install {
             binary,
+            menu_bar,
             dry_run,
             yes,
         } => {
-            let binary = binary.unwrap_or_else(service::default_daemon_binary);
-            if !binary.is_file() {
-                anyhow::bail!(
-                    "no daemon binary at {}\n\
-                     Build it with `cargo build --release`, or pass --binary <path>.",
-                    binary.display()
-                );
-            }
-            let binary = binary
-                .canonicalize()
-                .with_context(|| format!("resolving {}", binary.display()))?;
+            let job = job_for(menu_bar);
+            let path = service::plist_path(job);
+            let binary = service::resolve_binary(job, binary)?;
 
-            let definition = service::plist(&binary, paths.root(), &environment_overrides());
+            let definition = service::plist(job, &binary, paths.root(), &environment_overrides());
 
-            println!("Job label:  {}", service::LABEL);
+            println!("Job label:  {}", job.label());
             println!("Definition: {}\n", path.display());
             print!("{definition}");
 
@@ -507,33 +607,24 @@ fn service_command(paths: &Paths, action: ServiceAction) -> Result<()> {
                 println!("\nDry run — nothing was written.");
                 return Ok(());
             }
-            if !yes && !confirm()? {
+            if !yes && !confirm("Apply this change?")? {
                 println!("\nCancelled. Nothing was written.");
                 return Ok(());
             }
 
-            let directory = path.parent().unwrap_or(std::path::Path::new("."));
-            std::fs::create_dir_all(directory)
-                .with_context(|| format!("creating {}", directory.display()))?;
-
-            // Replacing a loaded job without unloading it first leaves launchd
-            // running the old binary, so an upgrade would silently do nothing.
-            if service::is_loaded() {
-                service::bootout().context("unloading the previous job")?;
-            }
-
-            std::fs::write(&path, definition)
-                .with_context(|| format!("writing {}", path.display()))?;
-            service::bootstrap(&path).context("loading the job")?;
+            service::install_job(job, &definition)?;
 
             println!("\nInstalled and started. It will start again at login.");
-            println!("Logs: {}/daemon.log", paths.root().display());
+            println!("Logs: {}/{}", paths.root().display(), job.log_name());
             Ok(())
         }
 
-        ServiceAction::Uninstall => {
-            if service::is_loaded() {
-                service::bootout().context("unloading the job")?;
+        ServiceAction::Uninstall { menu_bar } => {
+            let job = job_for(menu_bar);
+            let path = service::plist_path(job);
+
+            if service::is_loaded(job) {
+                service::bootout(job).context("unloading the job")?;
             }
             if path.exists() {
                 std::fs::remove_file(&path)
@@ -542,12 +633,26 @@ fn service_command(paths: &Paths, action: ServiceAction) -> Result<()> {
             } else {
                 println!("Not installed.");
             }
-            println!(
-                "\nStored data is untouched. Delete {} to remove it.",
-                paths.root().display()
-            );
+            if job == service::Job::Daemon {
+                println!(
+                    "\nStored data is untouched. Delete {} to remove it.",
+                    paths.root().display()
+                );
+            }
             Ok(())
         }
+    }
+}
+
+/// Which job a `--menu-bar` flag selects.
+///
+/// The collector is the default so that every existing invocation, and every
+/// line of documentation describing one, keeps meaning what it meant.
+const fn job_for(menu_bar: bool) -> service::Job {
+    if menu_bar {
+        service::Job::MenuBar
+    } else {
+        service::Job::Daemon
     }
 }
 
@@ -578,26 +683,8 @@ fn install_hooks(
     let (updated, change) = if uninstall {
         install::plan_uninstall(&current)
     } else {
-        let binary = binary.unwrap_or_else(install::file::default_hook_binary);
-
-        // A hook pointing at a missing binary fails silently: the agent ignores
-        // the exit code, so monitoring would simply never start and nothing
-        // would say why.
-        if !binary.is_file() {
-            anyhow::bail!(
-                "no hook binary at {}\n\
-                 Build it with `cargo build --release`, or pass --binary <path>.",
-                binary.display()
-            );
-        }
-
-        // Hooks run with the project directory as cwd, so a relative path
-        // would resolve somewhere else entirely — or nowhere.
-        let binary = binary
-            .canonicalize()
-            .with_context(|| format!("resolving {}", binary.display()))?;
-
-        install::plan_install(&current, &binary.to_string_lossy())
+        let executable = install::file::resolve_executable(binary)?;
+        install::plan_install(&current, &agentwatch_types::hook_command(&executable))
     };
 
     let action = if uninstall { "remove" } else { "install" };
@@ -618,24 +705,30 @@ fn install_hooks(
     let before = format!("{}\n", serde_json::to_string_pretty(&current)?);
     let after = format!("{}\n", serde_json::to_string_pretty(&updated)?);
 
-    println!(
-        "\nThis would {action} {} hook {}:\n",
-        if uninstall {
-            change.removed
-        } else {
-            change.added
-        },
-        if (if uninstall {
-            change.removed
-        } else {
-            change.added
-        }) == 1
-        {
-            "entry"
-        } else {
-            "entries"
+    let entries = |count: usize| if count == 1 { "entry" } else { "entries" };
+    if uninstall {
+        println!(
+            "\nThis would remove {} hook {}:\n",
+            change.removed,
+            entries(change.removed)
+        );
+    } else {
+        // Said separately, because they are different acts: one adds a hook
+        // where there was none, the other repoints one that was already there
+        // — which is how an upgrade from 0.1 looks, and worth seeing named.
+        let mut parts = Vec::new();
+        if change.added > 0 {
+            parts.push(format!("add {} {}", change.added, entries(change.added)));
         }
-    );
+        if change.updated > 0 {
+            parts.push(format!(
+                "repoint {} existing {}",
+                change.updated,
+                entries(change.updated)
+            ));
+        }
+        println!("\nThis would {}:\n", parts.join(" and "));
+    }
     print!("{}", install::unified_diff(&before, &after));
 
     if dry_run {
@@ -643,7 +736,7 @@ fn install_hooks(
         return Ok(());
     }
 
-    if !assume_yes && !confirm()? {
+    if !assume_yes && !confirm("Apply this change?")? {
         println!("\nCancelled. Nothing was written.");
         return Ok(());
     }
@@ -654,7 +747,9 @@ fn install_hooks(
         println!("Previous version saved to {}.", backup.display());
     }
     if !uninstall {
-        println!("\nStart the daemon with `agentwatch-daemon`, then open a new session.");
+        println!(
+            "\nStart the collector with `agentwatch service install`, then open a new session."
+        );
     }
     Ok(())
 }
@@ -664,7 +759,7 @@ fn install_hooks(
 /// A non-interactive run without `--yes` declines rather than proceeding: this
 /// edits the configuration of the agent being monitored, and a pipe is not
 /// consent.
-fn confirm() -> Result<bool> {
+fn confirm(question: &str) -> Result<bool> {
     use std::io::{IsTerminal as _, Write as _};
 
     if !std::io::stdin().is_terminal() {
@@ -672,7 +767,7 @@ fn confirm() -> Result<bool> {
         return Ok(false);
     }
 
-    print!("\nApply this change? [y/N] ");
+    print!("\n{question} [y/N] ");
     std::io::stdout().flush().context("prompting")?;
 
     let mut answer = String::new();

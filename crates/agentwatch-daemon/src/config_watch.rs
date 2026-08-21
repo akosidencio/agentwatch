@@ -13,9 +13,6 @@ use agentwatch_storage::{ConfigCheck, Store};
 use agentwatch_types::AgentId;
 use sha2::{Digest, Sha256};
 
-/// Marker identifying a hook entry as ours.
-const MARKER: &str = "agentwatch-hook";
-
 /// Settings files worth watching.
 ///
 /// Only Claude Code's for now, matching the only agent this version observes.
@@ -57,10 +54,27 @@ fn fingerprint(path: &Path) -> Option<(String, bool)> {
     };
 
     let canonical = serde_json::to_string(&sort_keys(&hooks)).ok()?;
-    let present = canonical.contains(MARKER);
+    let present = mentions_our_hook(&hooks);
 
     let digest = <Sha256 as Digest>::digest(canonical.as_bytes());
     Some((format!("{digest:x}"), present))
+}
+
+/// Whether any hook entry in this settings section is ours.
+///
+/// Walks the value rather than searching the serialized text: the command may
+/// be shell-quoted, and a substring search over the JSON would then miss it and
+/// report collection as disabled while it was running perfectly well. The
+/// predicate is shared with the installer so the two cannot drift apart.
+fn mentions_our_hook(hooks: &serde_json::Value) -> bool {
+    match hooks {
+        serde_json::Value::Object(map) => map.values().any(mentions_our_hook),
+        serde_json::Value::Array(items) => items.iter().any(mentions_our_hook),
+        serde_json::Value::String(_) => hooks
+            .as_str()
+            .is_some_and(agentwatch_types::is_our_hook_command),
+        _ => false,
+    }
 }
 
 /// Rebuilds a value with every object's keys in sorted order.
@@ -258,6 +272,42 @@ mod tests {
         );
         let (_, present) = fingerprint(&path).expect("fingerprint");
         assert!(present);
+    }
+
+    #[test]
+    fn both_hook_command_forms_are_detected() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        for command in [
+            // What 0.1 wrote: a standalone hook binary.
+            "/x/agentwatch-hook",
+            // What this version writes: one executable, one subcommand.
+            "/x/agentwatch hook",
+            // The same, from a path that needed shell quoting. A substring
+            // search over the serialized JSON misses this one and reports
+            // collection as disabled while it is running.
+            "'/x/My Tools/agentwatch' hook",
+        ] {
+            let path = write(
+                directory.path(),
+                &format!(
+                    r#"{{"hooks":{{"SessionStart":[{{"hooks":[{{"command":{}}}]}}]}}}}"#,
+                    serde_json::to_string(command).expect("json string")
+                ),
+            );
+            let (_, present) = fingerprint(&path).expect("fingerprint");
+            assert!(present, "{command} was not recognised");
+        }
+    }
+
+    #[test]
+    fn someone_elses_hooks_do_not_count_as_ours() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = write(
+            directory.path(),
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"command":"/x/other-tool"}]}]}}"#,
+        );
+        let (_, present) = fingerprint(&path).expect("fingerprint");
+        assert!(!present, "another tool's hooks are not evidence of ours");
     }
 
     #[test]

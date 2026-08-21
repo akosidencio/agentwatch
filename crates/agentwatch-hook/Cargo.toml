@@ -7,10 +7,6 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[[bin]]
-name = "agentwatch-hook"
-path = "src/main.rs"
-
 [dependencies]
 agentwatch-events.workspace = true
 agentwatch-types.workspace = true

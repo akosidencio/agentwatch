@@ -7,10 +7,6 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[[bin]]
-name = "agentwatch-daemon"
-path = "src/main.rs"
-
 [dependencies]
 agentwatch-adapter-claude.workspace = true
 agentwatch-events.workspace = true

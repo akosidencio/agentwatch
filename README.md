@@ -72,7 +72,7 @@ Linux, Windows, and other agents (Codex, Gemini) are not supported yet — see [
 
 ### Where it works
 
-Every local surface shares one `~/.claude/settings.json`, so `install-hooks`
+Every local surface shares one `~/.claude/settings.json`, so `agentwatch init`
 covers all of them at once.
 
 | Surface | Monitored | |
@@ -109,18 +109,25 @@ curl -fsSL https://github.com/akosidencio/agentwatch/releases/latest/download/ag
   | tar xz -C ~/.local/bin
 ```
 
-The archive contains three binaries — `agentwatch`, `agentwatch-daemon`, and `agentwatch-hook` — and they must all land somewhere on your `PATH`. Every release publishes a `SHA256SUMS` alongside them; the installer script verifies against it before writing anything, and you can check by hand with `shasum -a 256 -c SHA256SUMS`.
+The archive contains two binaries. `agentwatch` is the whole tool — the CLI, the collector, and the hook are one executable, dispatched by subcommand. `agentwatch-menubar` is the optional status item, and it is separate on purpose: see [why the menu bar is its own binary](#why-the-menu-bar-is-its-own-binary). Both go somewhere on your `PATH`.
 
-The binaries are unsigned. `curl` does not set the quarantine attribute, so they run as downloaded — but if you fetch them through a browser instead, Gatekeeper will quarantine them and you will have to clear it yourself.
+Every release publishes a `SHA256SUMS` alongside the archives; the installer verifies against it before writing anything, and you can check by hand with `shasum -a 256 -c SHA256SUMS`. The binaries are unsigned. `curl` does not set the quarantine attribute, so they run as downloaded — but if you fetch them through a browser instead, Gatekeeper will quarantine them and you will have to clear it yourself.
 
-Then wire it up:
+The installer also adds the install directory to your shell profile, unless it is already on your `PATH` (`AGENTWATCH_NO_MODIFY_PATH=1` to skip that).
+
+Then one command sets everything up:
 
 ```sh
-agentwatch install-hooks     # shows the exact settings diff and asks first
-agentwatch service install   # runs the daemon at login
+agentwatch init
 ```
 
+It registers the hooks, installs the collector as a LaunchAgent, starts the menu bar, and reads the history Claude Code has already written. It shows the whole plan — including the exact settings diff — and asks once before writing anything. `--dry-run` shows the plan and writes nothing; `--yes` skips the question; `--no-menu-bar` and `--no-import` leave those steps out.
+
+It is safe to re-run, and worth re-running after an upgrade: steps already done are reported as done, and a launchd job pointing at an older binary is re-pointed at the new one.
+
 Hooks are read at session start, so open a **new** agent session afterwards. An already-running session is not monitored.
+
+Typing `agentwatch` on its own prints the version, whether it is collecting, and the commands worth knowing. `agentwatch --help` is the full list.
 
 ### Why curl is the only supported install
 
@@ -132,10 +139,9 @@ If you package it downstream anyway, that is your prerogative — but it is unsu
 
 ## Quick start
 
-Import your history first. This reads every transcript Claude Code has already written, so the tool is useful on the day you install it rather than after a week of collecting:
+`agentwatch init` already imported your history, so there is data to look at immediately — every transcript Claude Code has written, not just what has been collected since you installed:
 
 ```sh
-agentwatch import                          # safe to re-run; nothing is double counted
 agentwatch tokens --all --by project       # where your tokens have gone, all time
 ```
 
@@ -204,25 +210,54 @@ agentwatch pause                                    # stop recording, reversibly
 agentwatch resume
 agentwatch service status
 agentwatch service install --dry-run                # show the job definition, write nothing
+agentwatch service install --menu-bar               # run the status item at login too
+agentwatch service status                           # report both jobs
 agentwatch install-hooks --dry-run                  # show the diff, write nothing
-agentwatch hook-config --binary /path/to/agentwatch-hook   # print settings, write nothing
+agentwatch hook-config --binary /path/to/agentwatch # print settings, write nothing
+agentwatch init --dry-run                           # show everything setup would do
 ```
 
 A pause takes effect within a fifth of a second, survives a daemon restart, and never stalls the agent — the daemon still drains connections, it just drops the writes.
 
 ### Menu bar (optional)
 
-Live agent state, today's tokens, alert count, and a pause toggle in the macOS menu bar. `agentwatch-menubar` is in the release archive alongside the other binaries — it is optional to *run*, not to install:
+Live agent state, today's tokens, alert count, and a pause toggle in the macOS menu bar. `agentwatch init` sets it up for you; `agentwatch-menubar` is in the release archive, so it is optional to *run*, not to install:
 
 ```sh
 agentwatch-menubar &
 ```
+
+It runs as a macOS *accessory*: no Dock tile, no app-switcher entry, just the status item. The icon is one of three glyphs — a filled aperture while collecting, two bars when paused, a hollow ring when the daemon is not running — beside today's token total, or `paused` / `off` when a bare number would misrepresent why it stopped moving. The menu carries today's counts, a pause toggle, and a shortcut that opens `agentwatch watch` in Terminal.
+
+It reads the database directly every two seconds and redraws only when something changed; it never talks to the daemon, so quitting the icon leaves collection running. It does need to sit in the same directory as `agentwatch`, which is how it finds the binary for the pause and live-view actions.
+
+To keep it across reboots, install it as its own LaunchAgent:
+
+```sh
+agentwatch service install --menu-bar
+```
+
+It is a separate job from the collector on purpose: a CLI-only user is never handed a menu bar item, and quitting the icon never stops collection. `agentwatch service status` reports both.
 
 It is excluded from the workspace's default members so that building from source stays cheap — `tray-icon` and `winit` add about 35 crates on macOS. From a checkout, build it explicitly:
 
 ```sh
 cargo build -p agentwatch-menubar --release
 ```
+
+#### Why the menu bar is its own binary
+
+Everything else is one executable. The menu bar is not, and the reason is measured rather than aesthetic.
+
+`tray-icon` and `winit` pull AppKit and CoreGraphics into whatever binary links them, and dyld loads those frameworks at every launch. The hook is launched by the agent on *every tool call*, so anything linked into it is paid for thousands of times a day. Same machine, same payload, no daemon listening, 150 spawns each:
+
+| binary | size | per hook spawn |
+| --- | --- | --- |
+| 0.1's standalone `agentwatch-hook` | 367 KB | 7.7 ms |
+| `agentwatch` — CLI + collector + hook | 4.6 MB | 9.0 ms |
+| the same, with the menu bar folded in | 4.9 MB | 12.8 ms |
+
+The menu bar adds 367 KB and 3.8 ms. Merging everything *except* it costs 1.3 ms and removes two binaries from the archive, which is a trade worth making; adding a status item nobody is looking at to the critical path of every tool call is not. `agentwatch-hook`'s latency test runs against the shipped `agentwatch hook`, so a dependency that changes this answer fails the build rather than quietly slowing every tool call down.
 
 ### Which surface a session ran in
 
@@ -252,7 +287,7 @@ Nothing leaves your machine. There is no network client in the codebase.
 claude code
     │  SessionStart / UserPromptSubmit / PostToolUse / SessionEnd
     ▼
-agentwatch-hook           spawn → write one frame → exit
+agentwatch hook           spawn → write one frame → exit
     │
     │  unix socket, u32-LE length prefix + JSON envelope
     ▼
@@ -263,7 +298,7 @@ daemon: ingest ──► mpsc(bounded) ──► normalize ──► batch ─�
                                     AgentEvent + EvidenceSource
 ```
 
-The hook runs on every tool call, in the critical path of your own work, so it depends on nothing that would slow its startup — no Tokio, no SQLite. It opens the socket, writes one frame, and exits. Measured round trip: **median 6.97ms, p95 8.27ms** (n=200, release build). The cost is process spawn, not our code. **The hook exits 0 on every path**, including "daemon not running", malformed input, and oversized payloads. It cannot fail one of your tool calls.
+The hook runs on every tool call, in the critical path of your own work, so the code it runs touches nothing that would slow its startup — no Tokio, no SQLite, no terminal. It opens the socket, writes one frame, and exits. Measured round trip: **~9ms** (n=150, release build; 7.7ms for 0.1's standalone binary — the difference is process spawn on a larger image, and is why [the menu bar stays separate](#why-the-menu-bar-is-its-own-binary)). **The hook exits 0 on every path**, including "daemon not running", malformed input, and oversized payloads. It cannot fail one of your tool calls.
 
 | Crate | Does |
 |---|---|
@@ -271,12 +306,14 @@ The hook runs on every tool call, in the critical path of your own work, so it d
 | `agentwatch-events` | The normalized event schema, the adapter trait, the wire format. |
 | `agentwatch-storage` | SQLite: migrations, batch writes, queries. |
 | `agentwatch-adapter-claude` | Claude Code hook payloads → events. Redaction lives here. |
-| `agentwatch-daemon` | Socket server, pipeline, batching, reconciliation. |
-| `agentwatch-hook` | The shim Claude Code spawns per tool call. |
-| `agentwatch-cli` | `agentwatch`. |
-| `agentwatch-menubar` | The macOS tray app. Opt-in build. |
+| `agentwatch-daemon` | Socket server, pipeline, batching, reconciliation. Runs as `agentwatch daemon`. |
+| `agentwatch-hook` | The shim Claude Code spawns per tool call. Runs as `agentwatch hook`. |
+| `agentwatch-cli` | The `agentwatch` binary. Every command, and the two above. |
+| `agentwatch-menubar` | The macOS tray app, and the one separate binary. |
 
-`install-hooks` adds its entries in their own matcher group, so hooks belonging to other tools are never modified and an uninstall removes exactly what was added. Every write shows a diff first and keeps a timestamped backup. This is verified in the test suite against a real settings file carrying another tool's hooks: install → uninstall restores it byte for byte, key order included.
+The crates stayed separate when the binaries merged: the hook still cannot reach the database or the runtime, because its crate does not depend on them. That boundary is the thing worth keeping, not the number of files in the archive.
+
+`init` and `install-hooks` add their entries in their own matcher group, so hooks belonging to other tools are never modified and an uninstall removes exactly what was added. Entries written by an older version are recognised and *repointed* rather than duplicated, which is what makes an upgrade safe: the alternative is a settings file pointing at a binary that no longer exists, and a hook that cannot run reports nothing without saying so. Every write shows a diff first and keeps a timestamped backup. This is verified in the test suite against a real settings file carrying another tool's hooks: install → uninstall restores it byte for byte, key order included.
 
 ## Known limitations
 
@@ -295,9 +332,18 @@ These are design consequences, stated up front rather than discovered later.
 - **Attempted-but-denied tool calls are not recorded.** `PreToolUse` needs a real captured payload to confirm a pre-hook can be correlated to its post-hook; installing both without that would double every tool call's rows for no gain.
 - **Claude Code's transcript format is undocumented.** AgentWatch is pinned to it, and a format change will need a release. `agentwatch verify` is how you find out.
 - **Retention is unbounded.** Nothing expires or vacuums yet.
-- **The menu bar icon has not been visually confirmed.** It builds, its formatting logic is unit tested, and it runs without error, but seeing the icon appear needs a GUI session.
 
 ## Roadmap
+
+### Shipped — v0.1.1
+
+Same feature set, one front door.
+
+- [x] **`agentwatch init`** — one command for hooks, the collector, the menu bar, and history. Shows the whole plan, asks once, safe to re-run.
+- [x] **One executable** — the CLI, the collector, and the hook are `agentwatch`, `agentwatch daemon`, and `agentwatch hook`. Four binaries became two; [the menu bar stays separate for a measured reason](#why-the-menu-bar-is-its-own-binary).
+- [x] **Safe upgrades** — hook entries written by 0.1 are recognised and repointed, never duplicated, and the binaries they pointed at are removed only after the launchd job has been rewritten.
+- [x] **`PATH` handled by the installer** — the warning it used to print scrolled past in a `curl | sh` pipe.
+- [x] **A welcome screen** — a bare `agentwatch` says what it is, whether it is collecting, and what to type next, instead of a usage error.
 
 ### Shipped — v0.1.0
 
@@ -341,7 +387,7 @@ Claude Code on macOS, local only. 304 tests, clippy clean.
 No. There is no network client in the codebase. Data lives in `~/.agentwatch/agentwatch.db` and nowhere else.
 
 **Will it slow down my agent?**
-The hook adds a measured ~7ms median per tool call, and that cost is process spawn rather than anything AgentWatch computes. It exits 0 on every path, so it cannot fail a tool call even when the daemon is down.
+The hook adds a measured ~9ms per tool call, and that cost is process spawn rather than anything AgentWatch computes — which is also why [the menu bar is a separate binary](#why-the-menu-bar-is-its-own-binary). It exits 0 on every path, so it cannot fail a tool call even when the daemon is down.
 
 **Can it read my prompts or my code?**
 No. Prompts are reduced to a character count and a hash at the adapter boundary, and tool responses are never deserialized. Shell command lines are stored in full, deliberately.
@@ -365,23 +411,29 @@ cd agentwatch
 cargo build --release
 cargo test
 
-mkdir -p ~/.local/bin
-cp target/release/agentwatch target/release/agentwatch-daemon target/release/agentwatch-hook ~/.local/bin/
+# The menu bar is outside the workspace's default members. Skip this line and
+# `init` reports the menu bar as unavailable rather than failing.
+cargo build --release -p agentwatch-menubar
 
-agentwatch install-hooks
-agentwatch service install
+mkdir -p ~/.local/bin
+cp target/release/agentwatch target/release/agentwatch-menubar ~/.local/bin/
+
+agentwatch init
 ```
+
+`init` wires everything to the binary that is running it, so a checkout can set itself up without touching an installed copy — and re-running the installed one later points everything back.
 
 ## Uninstall
 
 ```sh
 agentwatch install-hooks --uninstall
 agentwatch service uninstall
+agentwatch service uninstall --menu-bar
 rm -rf ~/.agentwatch          # deletes collected data
-rm ~/.local/bin/agentwatch ~/.local/bin/agentwatch-daemon ~/.local/bin/agentwatch-hook
+rm ~/.local/bin/agentwatch ~/.local/bin/agentwatch-menubar
 ```
 
-The hook uninstall removes exactly what was added and leaves any other tool's hooks untouched.
+The hook uninstall removes exactly what was added — including entries written by 0.1 — and leaves any other tool's hooks untouched. If the installer added a `PATH` line to your shell profile, it is marked `# added by the AgentWatch installer`.
 
 ## License
 

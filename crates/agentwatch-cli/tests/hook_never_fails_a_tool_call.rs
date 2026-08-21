@@ -1,5 +1,11 @@
 //! The invariant that outranks everything else: the hook exits 0 no matter
 //! what, and does it fast enough that nobody notices it ran.
+//!
+//! Lives with the CLI rather than with the hook library because what has to
+//! hold is the invariant of the *executable the agent actually runs*, which
+//! since 0.2 is `agentwatch hook` — the same binary that links SQLite, the
+//! terminal UI, and the async runtime. Testing the library in isolation would
+//! prove the cheap half and skip the part that could regress.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -12,10 +18,16 @@ use std::time::{Duration, Instant};
 use agentwatch_events::decode_frame_len;
 
 /// Path to the binary under test, supplied by Cargo.
-const HOOK_BINARY: &str = env!("CARGO_BIN_EXE_agentwatch-hook");
+const AGENTWATCH: &str = env!("CARGO_BIN_EXE_agentwatch");
 
 /// The ceiling the design depends on. Above this, the collection architecture
 /// has to change, so the test asserts it rather than trusting it.
+///
+/// This is the number that made merging everything into one binary a question
+/// rather than an obvious win: the hook spawns per tool call, and it now spawns
+/// an executable that also carries SQLite, ratatui, and tokio. Measured cost of
+/// that on this corpus was under a millisecond — process spawn dominates — but
+/// the test is here so a future dependency cannot quietly change the answer.
 const LATENCY_BUDGET: Duration = Duration::from_millis(30);
 
 /// A representative payload.
@@ -24,7 +36,8 @@ const PAYLOAD: &str = r#"{"hook_event_name":"PostToolUse","session_id":"s-1",
 
 /// Runs the hook with the given data directory and stdin, returning its status.
 fn run_hook(data_dir: &std::path::Path, stdin: &str) -> std::process::ExitStatus {
-    let mut child = Command::new(HOOK_BINARY)
+    let mut child = Command::new(AGENTWATCH)
+        .arg("hook")
         .env("AGENTWATCH_DIR", data_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -142,6 +155,18 @@ fn exits_promptly_when_the_daemon_accepts_but_never_reads() {
         elapsed < Duration::from_secs(2),
         "hook took {elapsed:?} against a daemon that never reads"
     );
+}
+
+#[test]
+fn a_human_running_it_by_hand_is_told_what_it_is_for() {
+    // Reads a payload on stdin, so typed at a terminal it would otherwise hang
+    // with no output at all.
+    let output = Command::new(AGENTWATCH)
+        .arg("hook")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert!(output.status.success());
 }
 
 #[test]

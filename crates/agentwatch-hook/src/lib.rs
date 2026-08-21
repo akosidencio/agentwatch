@@ -1,8 +1,14 @@
 //! The hook shim.
 //!
-//! Claude Code spawns this binary on every hooked tool call, so it sits in the
+//! Claude Code spawns this on every hooked tool call, so it sits in the
 //! critical path of the user's own work. It therefore does as close to nothing
 //! as possible: read stdin, wrap it, write one frame, exit.
+//!
+//! A library rather than its own binary since 0.2: everything ships as one
+//! `agentwatch` executable, and this is what `agentwatch hook` runs. The rule
+//! below is unchanged by that and unchanged by anything else linked into the
+//! same executable — nothing here touches the database, the runtime, or the
+//! terminal, and nothing here is allowed to start doing so.
 //!
 //! # The rule that outranks every other consideration
 //!
@@ -59,7 +65,11 @@ const TOTAL_BUDGET: Duration = Duration::from_millis(500);
 /// says so rather than failing later as an opaque write error.
 const ENVELOPE_HEADROOM: usize = 4096;
 
-fn main() {
+/// Forwards one hook payload from stdin to the daemon, then returns.
+///
+/// Returns rather than exiting, so the caller keeps ownership of the exit code
+/// — which, per the module docs, must be 0 on every path.
+pub fn run() {
     // The return value is deliberately discarded: see the module docs.
     //
     // The work runs on a thread so a blocked syscall cannot outlive the budget.
@@ -144,6 +154,6 @@ fn source_name() -> String {
 /// Reports a failure, but only when explicitly asked to.
 fn debug(message: &str) {
     if std::env::var_os(DEBUG_ENV).is_some() {
-        let _ = writeln!(std::io::stderr(), "agentwatch-hook: {message}");
+        let _ = writeln!(std::io::stderr(), "agentwatch hook: {message}");
     }
 }

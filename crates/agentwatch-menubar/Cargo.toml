@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 description = "Menu bar status item for AgentWatch"
 
+[[bin]]
+name = "agentwatch-menubar"
+path = "src/main.rs"
+
 [dependencies]
 agentwatch-storage.workspace = true
 agentwatch-types.workspace = true

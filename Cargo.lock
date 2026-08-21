@@ -26,7 +26,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agentwatch-adapter-claude"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agentwatch-events",
  "agentwatch-types",
@@ -39,10 +39,12 @@ dependencies = [
 
 [[package]]
 name = "agentwatch-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agentwatch-adapter-claude",
+ "agentwatch-daemon",
  "agentwatch-events",
+ "agentwatch-hook",
  "agentwatch-storage",
  "agentwatch-types",
  "anyhow",
@@ -56,7 +58,7 @@ dependencies = [
 
 [[package]]
 name = "agentwatch-daemon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agentwatch-adapter-claude",
  "agentwatch-events",
@@ -73,7 +75,7 @@ dependencies = [
 
 [[package]]
 name = "agentwatch-events"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agentwatch-types",
  "serde",
@@ -83,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "agentwatch-hook"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agentwatch-events",
  "agentwatch-types",
@@ -93,7 +95,7 @@ dependencies = [
 
 [[package]]
 name = "agentwatch-menubar"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agentwatch-storage",
  "agentwatch-types",
@@ -105,7 +107,7 @@ dependencies = [
 
 [[package]]
 name = "agentwatch-storage"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agentwatch-events",
  "agentwatch-types",
@@ -118,7 +120,7 @@ dependencies = [
 
 [[package]]
 name = "agentwatch-types"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "tempfile",

@@ -1,11 +1,12 @@
 //! The settings snippet that enables monitoring.
 //!
-//! This module prints and nothing else. Editing a user's agent configuration is
-//! a phase 4 concern, and it will show a diff and ask first — partly out of
-//! courtesy, and partly because a monitor that silently rewrites the config of
-//! the thing it monitors has no business calling itself a security tool.
+//! This module prints and nothing else. `agentwatch init` and `install-hooks`
+//! are what actually edit a settings file, and they show a diff and ask first —
+//! partly out of courtesy, and partly because a monitor that silently rewrites
+//! the config of the thing it monitors has no business calling itself a
+//! security tool. This is here for anyone who would rather paste it themselves.
 
-/// Hooks phase 1 installs.
+/// Hooks we register.
 ///
 /// `PreToolUse` is absent on purpose: with both installed every tool call would
 /// produce two events, and distinguishing "attempted" from "completed" needs
@@ -18,13 +19,18 @@ const HOOK_EVENTS: [&str; 4] = [
     "PostToolUse",
 ];
 
-/// Default location of the hook binary in a release build.
-const DEFAULT_BINARY: &str = "~/.local/bin/agentwatch-hook";
+/// Default command in a release install.
+///
+/// One executable serves every role, so the hook is a subcommand of it.
+const DEFAULT_BINARY: &str = "~/.local/bin/agentwatch hook";
 
 /// Renders the settings snippet.
 #[must_use]
 pub(crate) fn snippet(binary: Option<&str>) -> String {
-    let binary = binary.unwrap_or(DEFAULT_BINARY);
+    let binary = binary.map_or_else(
+        || DEFAULT_BINARY.to_owned(),
+        |path| agentwatch_types::hook_command(std::path::Path::new(path)),
+    );
 
     let mut hooks = String::new();
     for (index, event) in HOOK_EVENTS.iter().enumerate() {
@@ -80,9 +86,20 @@ mod tests {
 
     #[test]
     fn uses_the_supplied_binary_path() {
-        let output = snippet(Some("/opt/agentwatch-hook"));
-        assert!(output.contains("/opt/agentwatch-hook"));
+        let output = snippet(Some("/opt/agentwatch"));
+        assert!(output.contains("/opt/agentwatch hook"));
         assert!(!output.contains(DEFAULT_BINARY));
+    }
+
+    #[test]
+    fn what_it_prints_is_recognised_as_ours() {
+        // Otherwise someone who pastes this by hand ends up with entries that
+        // `install-hooks` would duplicate and `--uninstall` would not remove.
+        let output = snippet(Some("/opt/agentwatch"));
+        assert!(agentwatch_types::is_our_hook_command(
+            "/opt/agentwatch hook"
+        ));
+        assert!(output.contains("/opt/agentwatch hook"));
     }
 
     #[test]

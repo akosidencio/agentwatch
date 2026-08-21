@@ -11,13 +11,8 @@
 //!   diff shown to the user is generated from the same value that gets written.
 //! - Nothing is written without showing the exact diff and being told yes.
 
+use agentwatch_types::is_our_hook_command;
 use serde_json::{Map, Value, json};
-
-/// Substring identifying a hook entry as ours.
-///
-/// Matched against the command string. Anything containing it is ours to
-/// remove; anything else is left alone no matter how it got there.
-pub(crate) const MARKER: &str = "agentwatch-hook";
 
 /// Hook events we register for.
 pub(crate) const HOOK_EVENTS: [&str; 4] = [
@@ -34,20 +29,41 @@ pub(crate) struct Change {
     pub(crate) added: usize,
     /// Hook entries that would be removed.
     pub(crate) removed: usize,
+    /// Entries of ours already present, pointed somewhere else.
+    pub(crate) updated: usize,
 }
 
 impl Change {
     /// Whether anything would change.
     pub(crate) const fn is_empty(self) -> bool {
-        self.added == 0 && self.removed == 0
+        self.added == 0 && self.removed == 0 && self.updated == 0
+    }
+
+    /// Entries touched, however they were touched.
+    pub(crate) const fn total(self) -> usize {
+        self.added + self.removed + self.updated
     }
 }
 
 /// Returns settings with our hooks present, leaving everything else untouched.
 ///
-/// Idempotent: an event that already carries our command is not touched, so
-/// running this twice produces no second entry.
-pub(crate) fn plan_install(settings: &Value, binary: &str) -> (Value, Change) {
+/// `command` is the whole command line to register — see
+/// [`agentwatch_types::hook_command`], which is the only thing that should be
+/// building it.
+///
+/// Idempotent, in the sense that matters: after this, every hook event carries
+/// exactly one of our entries, and it runs `command`.
+///
+/// - An event already running `command` is not touched, so a second run does
+///   nothing and produces no duplicate.
+/// - An event carrying one of *our* entries pointing somewhere else is
+///   **rewritten** to `command`. This is the upgrade path, and getting it wrong
+///   is not cosmetic: 0.1 registered a separate `agentwatch-hook` binary, which
+///   this version folds into the executable and the installer removes. Left
+///   alone, those entries would point at a deleted file — and a hook that
+///   cannot run is a hook that reports nothing, silently.
+/// - Anyone else's entries are never read as ours, so they are never rewritten.
+pub(crate) fn plan_install(settings: &Value, command: &str) -> (Value, Change) {
     let mut updated = settings.clone();
     let mut change = Change::default();
 
@@ -74,14 +90,34 @@ pub(crate) fn plan_install(settings: &Value, binary: &str) -> (Value, Change) {
             continue;
         };
 
-        if groups.iter().any(group_contains_ours) {
+        // Repoint whatever of ours is already here. Every one of them, not
+        // just the first: a file that somehow collected two of our entries
+        // should come out of this pointing at one place, not two.
+        let mut found = false;
+        for entry in groups
+            .iter_mut()
+            .filter_map(|group| group.get_mut("hooks"))
+            .filter_map(Value::as_array_mut)
+            .flatten()
+            .filter(|entry| is_ours(entry))
+        {
+            found = true;
+            if entry.get("command").and_then(Value::as_str) == Some(command) {
+                continue;
+            }
+            if let Some(entry) = entry.as_object_mut() {
+                entry.insert("command".to_owned(), Value::String(command.to_owned()));
+                change.updated += 1;
+            }
+        }
+        if found {
             continue;
         }
 
         // Our own group, never appended to an existing one: an uninstall then
         // removes exactly what we added.
         groups.push(json!({
-            "hooks": [ { "type": "command", "command": binary } ]
+            "hooks": [ { "type": "command", "command": command } ]
         }));
         change.added += 1;
     }
@@ -138,20 +174,12 @@ pub(crate) fn plan_uninstall(settings: &Value) -> (Value, Change) {
     (updated, change)
 }
 
-/// Whether a matcher group contains one of our commands.
-fn group_contains_ours(group: &Value) -> bool {
-    group
-        .get("hooks")
-        .and_then(Value::as_array)
-        .is_some_and(|entries| entries.iter().any(is_ours))
-}
-
 /// Whether a single hook entry is ours.
 fn is_ours(entry: &Value) -> bool {
     entry
         .get("command")
         .and_then(Value::as_str)
-        .is_some_and(|command| command.contains(MARKER))
+        .is_some_and(is_our_hook_command)
 }
 
 /// Renders a unified diff between two texts.
@@ -224,7 +252,7 @@ mod tests {
     #[test]
     fn a_settings_file_with_a_hooks_value_we_do_not_understand_is_left_alone() {
         let odd = json!({ "hooks": "not an object" });
-        let (updated, change) = plan_install(&odd, "/bin/agentwatch-hook");
+        let (updated, change) = plan_install(&odd, "/bin/agentwatch hook");
 
         assert!(change.is_empty(), "we should decline rather than guess");
         assert_eq!(updated, odd, "a file we cannot parse must not be rewritten");
@@ -233,7 +261,7 @@ mod tests {
     #[test]
     fn a_hook_event_holding_something_other_than_an_array_is_skipped() {
         let odd = json!({ "hooks": { "SessionStart": "nonsense" } });
-        let (updated, change) = plan_install(&odd, "/bin/agentwatch-hook");
+        let (updated, change) = plan_install(&odd, "/bin/agentwatch hook");
 
         assert_eq!(
             updated["hooks"]["SessionStart"], "nonsense",
@@ -248,7 +276,7 @@ mod tests {
 
     #[test]
     fn installing_adds_every_hook_event() {
-        let (updated, change) = plan_install(&json!({}), "/bin/agentwatch-hook");
+        let (updated, change) = plan_install(&json!({}), "/bin/agentwatch hook");
 
         assert_eq!(change.added, HOOK_EVENTS.len());
         let hooks = updated
@@ -261,9 +289,37 @@ mod tests {
     }
 
     #[test]
+    fn a_moved_executable_is_repointed_rather_than_duplicated() {
+        let (installed, _) = plan_install(&json!({}), "/old/place/agentwatch hook");
+        let (moved, change) = plan_install(&installed, "/new/place/agentwatch hook");
+
+        assert_eq!(change.updated, HOOK_EVENTS.len());
+        assert_eq!(change.added, 0);
+        for event in HOOK_EVENTS {
+            let groups = moved["hooks"][event].as_array().expect("groups");
+            assert_eq!(groups.len(), 1, "{event} grew a second entry");
+            assert_eq!(
+                groups[0]["hooks"][0]["command"],
+                "/new/place/agentwatch hook"
+            );
+        }
+    }
+
+    #[test]
+    fn a_foreign_hook_is_never_repointed() {
+        let original = with_foreign_hooks();
+        let (updated, _) = plan_install(&original, "/bin/agentwatch hook");
+
+        assert_eq!(
+            updated["hooks"]["SessionStart"][0], original["hooks"]["SessionStart"][0],
+            "another tool's command must survive byte for byte"
+        );
+    }
+
+    #[test]
     fn installing_twice_changes_nothing_the_second_time() {
-        let (once, _) = plan_install(&json!({}), "/bin/agentwatch-hook");
-        let (twice, change) = plan_install(&once, "/bin/agentwatch-hook");
+        let (once, _) = plan_install(&json!({}), "/bin/agentwatch hook");
+        let (twice, change) = plan_install(&once, "/bin/agentwatch hook");
 
         assert!(change.is_empty(), "a second install should be a no-op");
         assert_eq!(once, twice);
@@ -272,7 +328,7 @@ mod tests {
     #[test]
     fn installing_preserves_another_tools_hooks() {
         let original = with_foreign_hooks();
-        let (updated, _) = plan_install(&original, "/bin/agentwatch-hook");
+        let (updated, _) = plan_install(&original, "/bin/agentwatch hook");
 
         let session_start = updated["hooks"]["SessionStart"].as_array().expect("array");
         assert_eq!(session_start.len(), 2, "ours should be a separate group");
@@ -283,7 +339,7 @@ mod tests {
     #[test]
     fn installing_preserves_unrelated_settings() {
         let original = with_foreign_hooks();
-        let (updated, _) = plan_install(&original, "/bin/agentwatch-hook");
+        let (updated, _) = plan_install(&original, "/bin/agentwatch hook");
 
         assert_eq!(updated["permissions"], original["permissions"]);
         assert_eq!(updated["model"], original["model"]);
@@ -291,22 +347,58 @@ mod tests {
 
     #[test]
     fn installing_never_appends_into_a_foreign_group() {
-        let (updated, _) = plan_install(&with_foreign_hooks(), "/bin/agentwatch-hook");
+        let (updated, _) = plan_install(&with_foreign_hooks(), "/bin/agentwatch hook");
 
         let foreign = &updated["hooks"]["SessionStart"][0]["hooks"];
         assert_eq!(foreign.as_array().map(Vec::len), Some(1));
-        assert!(
-            !foreign[0]["command"]
-                .as_str()
-                .expect("command")
-                .contains(MARKER)
+        assert!(!is_our_hook_command(
+            foreign[0]["command"].as_str().expect("command")
+        ));
+    }
+
+    #[test]
+    fn entries_written_by_the_standalone_binary_are_not_duplicated() {
+        let old_style = json!({
+            "hooks": {
+                "SessionStart": [
+                    { "hooks": [
+                        { "type": "command", "command": "/Users/a/.local/bin/agentwatch-hook" }
+                    ] }
+                ]
+            }
+        });
+        let command = "/Users/a/.local/bin/agentwatch hook";
+        let (updated, change) = plan_install(&old_style, command);
+
+        assert_eq!(
+            change.added,
+            HOOK_EVENTS.len() - 1,
+            "the other three events"
+        );
+        assert_eq!(change.updated, 1, "the event 0.1 already covered");
+        assert_eq!(
+            updated["hooks"]["SessionStart"].as_array().map(Vec::len),
+            Some(1),
+            "an upgrade must not put two hooks on one event"
+        );
+        assert_eq!(
+            updated["hooks"]["SessionStart"][0]["hooks"][0]["command"], command,
+            "left pointing at 0.1's deleted binary, this hook silently never runs"
+        );
+
+        let (removed, change) = plan_uninstall(&updated);
+        assert_eq!(change.removed, HOOK_EVENTS.len());
+        assert_eq!(
+            removed,
+            json!({}),
+            "uninstall must clear the old entries too, not just ours"
         );
     }
 
     #[test]
     fn uninstalling_removes_exactly_what_install_added() {
         let original = with_foreign_hooks();
-        let (installed, _) = plan_install(&original, "/bin/agentwatch-hook");
+        let (installed, _) = plan_install(&original, "/bin/agentwatch hook");
         let (removed, change) = plan_uninstall(&installed);
 
         assert_eq!(change.removed, HOOK_EVENTS.len());
@@ -327,7 +419,7 @@ mod tests {
 
     #[test]
     fn uninstalling_prunes_the_hooks_key_it_created() {
-        let (installed, _) = plan_install(&json!({ "model": "opus" }), "/bin/agentwatch-hook");
+        let (installed, _) = plan_install(&json!({ "model": "opus" }), "/bin/agentwatch hook");
         let (removed, _) = plan_uninstall(&installed);
 
         assert_eq!(
@@ -344,7 +436,7 @@ mod tests {
                 "SessionStart": [
                     { "hooks": [
                         { "type": "command", "command": "/other/tool" },
-                        { "type": "command", "command": "/bin/agentwatch-hook" }
+                        { "type": "command", "command": "/bin/agentwatch hook" }
                     ] }
                 ]
             }
@@ -362,7 +454,7 @@ mod tests {
 
     #[test]
     fn pretooluse_is_still_not_installed() {
-        let (updated, _) = plan_install(&json!({}), "/bin/agentwatch-hook");
+        let (updated, _) = plan_install(&json!({}), "/bin/agentwatch hook");
         assert!(updated["hooks"].get("PreToolUse").is_none());
     }
 
@@ -370,7 +462,7 @@ mod tests {
     fn key_order_survives_a_round_trip() {
         let text = r#"{"permissions":{},"model":"opus","hooks":{}}"#;
         let settings: Value = serde_json::from_str(text).expect("parse");
-        let (updated, _) = plan_install(&settings, "/bin/agentwatch-hook");
+        let (updated, _) = plan_install(&settings, "/bin/agentwatch hook");
 
         let keys: Vec<&str> = updated
             .as_object()
@@ -428,22 +520,43 @@ pub(crate) mod file {
             .join("settings.json")
     }
 
-    /// Best guess at where our hook binary lives.
+    /// The executable to register, run, and point launchd at.
     ///
-    /// Prefers a sibling of the running executable, because someone running
-    /// `./agentwatch install-hooks` out of a build directory means that build.
-    pub(crate) fn default_hook_binary() -> PathBuf {
-        if let Ok(current) = std::env::current_exe()
-            && let Some(directory) = current.parent()
-        {
-            let sibling = directory.join("agentwatch-hook");
-            if sibling.is_file() {
-                return sibling;
-            }
+    /// The running one: everything ships as a single binary, so the thing being
+    /// asked to install itself is the thing to install. Resolved through
+    /// [`Path::canonicalize`] by the caller — the agent runs hooks with the
+    /// project as its working directory, where a relative path means something
+    /// else entirely.
+    pub(crate) fn default_executable() -> PathBuf {
+        std::env::current_exe().unwrap_or_else(|_| {
+            let home = std::env::var_os("HOME").map_or_else(PathBuf::new, PathBuf::from);
+            home.join(".local/bin/agentwatch")
+        })
+    }
+
+    /// Resolves the executable to register, and checks it is really there.
+    ///
+    /// A hook entry pointing at a missing file fails silently — the agent
+    /// ignores the hook's exit code — so monitoring would simply never start
+    /// and nothing would say why. Checked here, before the diff is even shown.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path is not a file, or cannot be resolved.
+    pub(crate) fn resolve_executable(explicit: Option<PathBuf>) -> Result<PathBuf> {
+        let executable = explicit.unwrap_or_else(default_executable);
+        if !executable.is_file() {
+            bail!(
+                "no agentwatch executable at {}\nBuild it with `cargo build --release`, or pass --binary <path>.",
+                executable.display()
+            );
         }
 
-        let home = std::env::var_os("HOME").map_or_else(PathBuf::new, PathBuf::from);
-        home.join(".local/bin/agentwatch-hook")
+        // Hooks run with the project directory as the working directory, so a
+        // relative path would resolve somewhere else entirely — or nowhere.
+        executable
+            .canonicalize()
+            .with_context(|| format!("resolving {}", executable.display()))
     }
 
     /// Reads settings, treating a missing file as an empty object.
@@ -602,7 +715,7 @@ mod file_tests {
         std::fs::write(&path, r#"{"permissions":{},"model":"opus"}"#).expect("write");
 
         let settings = file::read(&path).expect("read");
-        let (updated, _) = plan_install(&settings, "/bin/agentwatch-hook");
+        let (updated, _) = plan_install(&settings, "/bin/agentwatch hook");
         file::write(&path, &updated).expect("write");
 
         let text = std::fs::read_to_string(&path).expect("read");

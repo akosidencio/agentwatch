@@ -5,20 +5,28 @@
 #   curl -fsSL https://github.com/akosidencio/agentwatch/releases/latest/download/install.sh | sh
 #
 # Downloads the release archive for this machine, verifies it against the
-# published SHA256SUMS, and puts four binaries on your PATH. It does not touch
-# your Claude Code settings and does not install a service: both are separate,
-# explicit commands that show you what they will do first.
+# published SHA256SUMS, and puts it on your PATH. Then it tells you to run
+# `agentwatch init`, which is the one command that sets everything up.
+#
+# This script does not touch your Claude Code settings and does not install a
+# service. `init` does both, and shows you the diff and the job definition
+# before it writes anything.
 #
 # Environment:
-#   AGENTWATCH_VERSION   tag to install, e.g. v0.1.0   (default: latest)
-#   AGENTWATCH_BIN_DIR   install directory             (default: ~/.local/bin)
+#   AGENTWATCH_VERSION          tag to install, e.g. v0.2.0  (default: latest)
+#   AGENTWATCH_BIN_DIR          install directory            (default: ~/.local/bin)
+#   AGENTWATCH_NO_MODIFY_PATH   set to 1 to leave your shell profile alone
 
 set -eu
 
 REPO="akosidencio/agentwatch"
 VERSION="${AGENTWATCH_VERSION:-latest}"
 BIN_DIR="${AGENTWATCH_BIN_DIR:-$HOME/.local/bin}"
-BINARIES="agentwatch agentwatch-daemon agentwatch-hook agentwatch-menubar"
+# The executable, and anything else the archive happens to carry. Only the
+# first is required; the rest are installed if present, so adding or dropping a
+# companion binary in a release does not need a new installer.
+REQUIRED="agentwatch"
+OPTIONAL="agentwatch-menubar"
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -91,13 +99,14 @@ say "  ok ($actual)"
 
 tar -xzf "$tmp/$archive" -C "$tmp"
 
-for binary in $BINARIES; do
+for binary in $REQUIRED; do
     [ -f "$tmp/$binary" ] || die "$archive did not contain $binary"
 done
 
 mkdir -p "$BIN_DIR" || die "could not create $BIN_DIR"
 
-for binary in $BINARIES; do
+for binary in $REQUIRED $OPTIONAL; do
+    [ -f "$tmp/$binary" ] || continue
     # Replace by rename so a running daemon keeps its open inode rather than
     # having its file rewritten underneath it.
     chmod 755 "$tmp/$binary"
@@ -106,30 +115,92 @@ for binary in $BINARIES; do
     say "installed $BIN_DIR/$binary"
 done
 
+# Binaries from 0.1 are deliberately left alone here. They are dead weight now,
+# but one of them is what the installed launchd job still runs: removing it
+# before `init` has rewritten that job would stop collection. `init` cleans them
+# up, in that order.
+
 installed="$("$BIN_DIR/agentwatch" --version 2>/dev/null || true)"
 [ -n "$installed" ] || die "$BIN_DIR/agentwatch did not run after installation"
-say ""
-say "$installed"
 
-# --- what to do next ----------------------------------------------------------
+# --- PATH ---------------------------------------------------------------------
+#
+# A printed warning is the wrong tool here: in a `curl | sh` pipe it scrolls
+# past, and the very next thing the user is told to type is a command that will
+# not resolve. So the profile is edited, with a marker line saying who did it
+# and how to opt out. Set AGENTWATCH_NO_MODIFY_PATH=1 to be left alone.
 
-case ":$PATH:" in
-    *":$BIN_DIR:"*) ;;
-    *)
-        say ""
-        say "NOTE: $BIN_DIR is not on your PATH. Add this to your shell profile:"
-        say ""
-        say "  export PATH=\"\$PATH:$BIN_DIR\""
-        ;;
+MARKER="# added by the AgentWatch installer"
+
+# The profile the user's own login shell reads. $SHELL rather than $0: this
+# script runs under sh regardless of what the user actually uses.
+case "${SHELL##*/}" in
+    zsh)  profile="$HOME/.zshrc" ;;
+    bash) if [ -f "$HOME/.bash_profile" ]; then
+              profile="$HOME/.bash_profile"
+          else
+              profile="$HOME/.bashrc"
+          fi ;;
+    fish) profile="$HOME/.config/fish/config.fish" ;;
+    *)    profile="" ;;
 esac
 
-cat <<'NEXT'
+# $HOME left unexpanded where it applies, so the line stays correct if the home
+# directory is ever mounted somewhere else.
+case "$BIN_DIR" in
+    "$HOME"/*) path_line="export PATH=\"\$PATH:\$HOME${BIN_DIR#"$HOME"}\"" ;;
+    *)         path_line="export PATH=\"\$PATH:$BIN_DIR\"" ;;
+esac
+[ "${SHELL##*/}" = "fish" ] && path_line="fish_add_path $BIN_DIR"
 
-Next steps:
+on_path=no
+case ":$PATH:" in *":$BIN_DIR:"*) on_path=yes ;; esac
 
-  agentwatch install-hooks    # register the hooks; shows the diff and asks first
-  agentwatch service install  # run the daemon at login
-  agentwatch import           # read the history Claude Code has already written
+if [ "$on_path" = "yes" ]; then
+    :
+elif [ "${AGENTWATCH_NO_MODIFY_PATH:-0}" = "1" ]; then
+    say ""
+    say "NOTE: $BIN_DIR is not on your PATH. Add this yourself:"
+    say ""
+    say "  $path_line"
+elif [ -z "$profile" ]; then
+    say ""
+    say "NOTE: $BIN_DIR is not on your PATH, and I do not know which profile"
+    say "      ${SHELL:-your shell} reads. Add this to it:"
+    say ""
+    say "  $path_line"
+elif grep -Fq "$MARKER" "$profile" 2>/dev/null; then
+    # Already added, and still not on PATH: the profile has not been reloaded.
+    say ""
+    say "NOTE: $profile already adds $BIN_DIR, but this shell has not read it yet."
+else
+    mkdir -p "$(dirname "$profile")" 2>/dev/null || true
+    {
+        printf '\n%s\n' "$MARKER"
+        printf '%s\n' "$path_line"
+    } >> "$profile" || die "could not append to $profile"
+    say ""
+    say "added $BIN_DIR to your PATH in $profile"
+    say "(AGENTWATCH_NO_MODIFY_PATH=1 skips that)"
+fi
 
-Hooks are read at session start, so open a new agent session afterwards.
-NEXT
+# --- welcome ------------------------------------------------------------------
+#
+# Printed by running the binary that was just installed, rather than echoed from
+# here: one definition of the greeting, and it doubles as proof that what landed
+# on disk actually runs. A bare invocation is the welcome screen — the banner,
+# the version, the state, and what to type next.
+
+say ""
+"$BIN_DIR/agentwatch" || die "$BIN_DIR/agentwatch did not run after installation"
+
+# The one command to type next, spelled absolutely: the profile edit above does
+# not affect the shell reading this, so a bare `agentwatch` may not resolve yet.
+if [ "$on_path" != "yes" ]; then
+    say ""
+    say "  This shell has not picked up your PATH yet, so start with:"
+    say ""
+    say "      $BIN_DIR/agentwatch init"
+    say ""
+    say "  In a new terminal, plain \`agentwatch\` works."
+fi
