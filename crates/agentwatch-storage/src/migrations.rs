@@ -232,6 +232,21 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
            );
     ",
     },
+    Migration {
+        version: 6,
+        name: "config_watch",
+        sql: r"
+        -- Last known fingerprint of each settings file we watch, so a change
+        -- made while the daemon was not running is still noticed at next start
+        -- rather than only while we happen to be looking.
+        CREATE TABLE config_watch (
+            path          TEXT PRIMARY KEY,
+            fingerprint   TEXT NOT NULL,
+            hooks_present INTEGER NOT NULL,
+            updated_at_us INTEGER NOT NULL
+        ) STRICT;
+    ",
+    },
 ];
 
 /// The schema version this build expects.

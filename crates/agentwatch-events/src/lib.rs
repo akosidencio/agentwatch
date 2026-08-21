@@ -17,8 +17,8 @@ mod wire;
 pub use adapter::{AdapterError, HookAdapter};
 pub use command_scan::{PathReference, scan_command, worst_in_command};
 pub use event::{
-    AgentEvent, CommandEvent, Event, FileEvent, McpEvent, PromptEvent, SessionEnded,
-    SessionStarted, TokenUsageEvent, ToolCallEvent, UnknownEvent,
+    AgentEvent, CollectionEvent, CommandEvent, ConfigChangedEvent, Event, FileEvent, McpEvent,
+    PromptEvent, SessionEnded, SessionStarted, TokenUsageEvent, ToolCallEvent, UnknownEvent,
 };
 pub use evidence::{Confidence, EvidenceSource};
 pub use sensitivity::{Sensitivity, classify};

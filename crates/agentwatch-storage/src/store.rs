@@ -306,10 +306,14 @@ fn write_projection(
                 params![id, timestamp, agent, session, project, mcp.server, mcp.tool, now],
             )?;
         }
+        // No side table: the generic `events` row carries all of these, and
+        // none has a per-kind dimension worth indexing separately.
         Event::SessionStarted(_)
         | Event::SessionEnded(_)
         | Event::Prompt(_)
         | Event::ToolCall(_)
+        | Event::ConfigChanged(_)
+        | Event::Collection(_)
         | Event::Unknown(_) => {}
     }
 

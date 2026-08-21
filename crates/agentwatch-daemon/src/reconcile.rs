@@ -122,6 +122,10 @@ pub fn sweep(store: &mut Store) -> Result<ReconcileReport, StoreError> {
         report.written += one.written;
     }
 
+    // Same cadence as the rest of the sweep: cheap, and a change made while we
+    // were not running is still caught at the next start.
+    crate::config_watch::sweep(store);
+
     // Resolution touches the filesystem, so it runs here rather than on the
     // write path. Cheap to repeat: only newly seen directories are examined.
     match store.backfill_repositories(&mut RepositoryResolver::new()) {

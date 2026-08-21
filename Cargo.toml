@@ -2,6 +2,20 @@
 resolver = "3"
 members = ["crates/*"]
 
+# The menu bar is excluded from the default build. `tray-icon` and `winit`
+# together roughly double the dependency tree, which is a poor trade to force on
+# everyone using a security tool from the command line. Build it explicitly:
+#   cargo build -p agentwatch-menubar --release
+default-members = [
+    "crates/agentwatch-types",
+    "crates/agentwatch-events",
+    "crates/agentwatch-storage",
+    "crates/agentwatch-adapter-claude",
+    "crates/agentwatch-cli",
+    "crates/agentwatch-daemon",
+    "crates/agentwatch-hook",
+]
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
@@ -21,7 +35,7 @@ ratatui = "0.29"
 crossterm = "0.29"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = { version = "1.0", features = ["raw_value"] }
+serde_json = { version = "1.0", features = ["raw_value", "preserve_order"] }
 sha2 = "0.10"
 thiserror = "2.0"
 time = { version = "0.3", features = ["formatting", "local-offset", "macros", "parsing", "serde"] }

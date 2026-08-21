@@ -2,6 +2,7 @@
 
 use agentwatch_storage::{EventRow, Notable, SessionRow, TokenTotals};
 use agentwatch_types::Timestamp;
+pub(crate) use agentwatch_types::thousands;
 
 /// What the sensitive-access listing cannot tell you.
 ///
@@ -93,24 +94,6 @@ pub(crate) fn notable_line(row: &Notable) -> String {
     )
 }
 
-/// Formats an integer with thousands separators.
-///
-/// Token counts run to ten digits; unseparated they are unreadable.
-pub(crate) fn thousands(value: i64) -> String {
-    let negative = value < 0;
-    let digits = value.unsigned_abs().to_string();
-
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3 + 1);
-    for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(digit);
-    }
-
-    if negative { format!("-{out}") } else { out }
-}
-
 /// The column header for a token breakdown.
 pub(crate) fn group_header(by: &str) -> String {
     format!("{by:<34} {:>14} {:>7}", "tokens", "share")
@@ -196,6 +179,26 @@ fn detail(kind: &str, payload: &str) -> String {
                 "{}.{}",
                 string_field(&value, "server"),
                 string_field(&value, "tool")
+            );
+        }
+        "collection.paused" => return "collection PAUSED by the user".to_owned(),
+        "collection.resumed" => return "collection resumed".to_owned(),
+        "config.changed" => {
+            // The transition, not the path, is the story: a timeline row saying
+            // only that a file changed leaves the reader to work out whether
+            // monitoring is still running.
+            let present = value
+                .get("hooks_present")
+                .and_then(serde_json::Value::as_bool);
+            let state = match present {
+                Some(true) => "hooks present",
+                Some(false) => "OUR HOOKS REMOVED — collection stopped",
+                None => "changed",
+            };
+            let home = std::env::var("HOME").ok();
+            return format!(
+                "{state}  {}",
+                short_path(&string_field(&value, "path"), home.as_deref())
             );
         }
         _ => return String::new(),
@@ -326,11 +329,23 @@ mod tests {
     }
 
     #[test]
-    fn separates_thousands() {
-        assert_eq!(thousands(1_507_299_516), "1,507,299,516");
-        assert_eq!(thousands(999), "999");
-        assert_eq!(thousands(1_000), "1,000");
-        assert_eq!(thousands(0), "0");
+    fn a_config_change_that_removed_our_hooks_says_so_loudly() {
+        let line = detail(
+            "config.changed",
+            r#"{"path":"/Users/dev/.claude/settings.json","hooks_present":false}"#,
+        );
+        assert!(line.contains("REMOVED"), "{line}");
+        assert!(line.contains("collection stopped"), "{line}");
+    }
+
+    #[test]
+    fn a_config_change_that_kept_our_hooks_is_stated_plainly() {
+        let line = detail(
+            "config.changed",
+            r#"{"path":"/Users/dev/.claude/settings.json","hooks_present":true}"#,
+        );
+        assert!(line.contains("hooks present"), "{line}");
+        assert!(!line.contains("REMOVED"), "{line}");
     }
 
     #[test]

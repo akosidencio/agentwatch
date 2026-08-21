@@ -6,6 +6,7 @@
 
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
+mod config_watch;
 mod migrations;
 mod query;
 mod repositories;
@@ -14,6 +15,7 @@ mod sessions;
 mod store;
 mod tokens;
 
+pub use config_watch::ConfigCheck;
 pub use query::{EventRow, Totals};
 pub use repositories::BackfillReport;
 pub use security::Notable;

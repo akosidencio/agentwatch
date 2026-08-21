@@ -112,7 +112,7 @@ impl Daemon {
         let (events, queue) = channel(INGEST_QUEUE_DEPTH);
         let session_ended = Arc::new(Notify::new());
 
-        let batcher = tokio::spawn(batcher::run(queue, store));
+        let batcher = tokio::spawn(batcher::run(queue, store, paths.clone()));
         let server = tokio::spawn(server::serve(
             listener,
             registry,

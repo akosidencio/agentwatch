@@ -12,6 +12,8 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 mod batcher;
+mod config_watch;
+mod pause;
 mod pipeline;
 mod reconcile;
 mod registry;

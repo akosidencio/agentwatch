@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use agentwatch_events::AgentEvent;
 use agentwatch_storage::Store;
-use agentwatch_types::RepositoryResolver;
+use agentwatch_types::{Paths, RepositoryResolver};
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::time::Instant;
 
@@ -27,8 +27,8 @@ const WRITE_QUEUE_DEPTH: usize = 16;
 /// Consumes normalized events, batches them, and writes them.
 ///
 /// Returns when `events` closes and the final partial batch has been written.
-pub(crate) async fn run(mut events: Receiver<AgentEvent>, store: Store) {
-    let (batches, writer) = spawn_writer(store);
+pub(crate) async fn run(mut events: Receiver<AgentEvent>, store: Store, paths: Paths) {
+    let (batches, writer) = spawn_writer(store, paths);
     let mut buffer: Vec<AgentEvent> = Vec::with_capacity(BATCH_SIZE);
     let mut deadline: Option<Instant> = None;
 
@@ -95,14 +95,25 @@ async fn flush(
 }
 
 /// Starts the thread that owns the database connection.
-fn spawn_writer(mut store: Store) -> (Sender<Vec<AgentEvent>>, tokio::task::JoinHandle<()>) {
+fn spawn_writer(
+    mut store: Store,
+    paths: Paths,
+) -> (Sender<Vec<AgentEvent>>, tokio::task::JoinHandle<()>) {
     let (sender, mut receiver) = channel::<Vec<AgentEvent>>(WRITE_QUEUE_DEPTH);
 
     // Lives with the writer thread so its cache survives between batches.
     let mut resolver = RepositoryResolver::new();
+    let mut pause = crate::pause::Pause::new(paths);
 
     let handle = tokio::task::spawn_blocking(move || {
         while let Some(batch) = receiver.blocking_recv() {
+            // Checked per batch rather than per event: the marker is a stat()
+            // and a batch is at most a fifth of a second of activity.
+            if pause.check(&mut store) {
+                tracing::debug!(dropped = batch.len(), "collection paused");
+                continue;
+            }
+
             match store.insert_events(&batch) {
                 Ok(written) => {
                     tracing::debug!(written, queued = batch.len(), "wrote batch");
@@ -153,7 +164,12 @@ mod tests {
 
         let (sender, receiver) = channel(64);
         let store = Store::open(&database).expect("open");
-        let task = tokio::spawn(run(receiver, store));
+        let directory = tempfile::tempdir().expect("temp dir");
+        let task = tokio::spawn(run(
+            receiver,
+            store,
+            Paths::with_root(directory.path().to_path_buf()),
+        ));
 
         sender.send(event("cargo test")).await.expect("queued");
         drop(sender);
@@ -170,7 +186,12 @@ mod tests {
 
         let (sender, receiver) = channel(64);
         let store = Store::open(&database).expect("open");
-        let task = tokio::spawn(run(receiver, store));
+        let directory = tempfile::tempdir().expect("temp dir");
+        let task = tokio::spawn(run(
+            receiver,
+            store,
+            Paths::with_root(directory.path().to_path_buf()),
+        ));
 
         // The sender is deliberately still open: nothing but the flush interval
         // can cause this single event to be written.
@@ -208,7 +229,12 @@ mod tests {
 
         let (sender, receiver) = channel(BATCH_SIZE * 4);
         let store = Store::open(&database).expect("open");
-        let task = tokio::spawn(run(receiver, store));
+        let directory = tempfile::tempdir().expect("temp dir");
+        let task = tokio::spawn(run(
+            receiver,
+            store,
+            Paths::with_root(directory.path().to_path_buf()),
+        ));
 
         let total = BATCH_SIZE * 2 + 7;
         for index in 0..total {

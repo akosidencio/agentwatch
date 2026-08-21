@@ -1,0 +1,19 @@
+[package]
+name = "agentwatch-menubar"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Menu bar status item for AgentWatch"
+
+[dependencies]
+agentwatch-storage.workspace = true
+agentwatch-types.workspace = true
+anyhow.workspace = true
+time.workspace = true
+
+tray-icon = { version = "0.24", default-features = false }
+winit = "0.30"
+
+[lints]
+workspace = true

@@ -5,7 +5,7 @@ See what your AI agents are doing on your machine.
 Local-first activity monitoring for AI coding agents. Everything stays on your
 machine: no network calls, no accounts, no telemetry leaving the box.
 
-**Status:** phase 3 of 4. Claude Code on macOS only. See [PLAN.md](PLAN.md).
+**Status:** phase 4 of 4 complete. Claude Code on macOS only. See [PLAN.md](PLAN.md).
 
 ## What it does today
 
@@ -26,6 +26,64 @@ Reads every transcript Claude Code has already written, so the tool is useful
 on the day you install it rather than after a week of collecting. Safe to run
 repeatedly — nothing is double counted.
 
+## Install
+
+```sh
+cargo build --release
+
+# Put the binaries somewhere on PATH
+mkdir -p ~/.local/bin
+cp target/release/agentwatch target/release/agentwatch-daemon target/release/agentwatch-hook ~/.local/bin/
+
+# Register the hooks. Shows the exact diff of your settings and asks first.
+agentwatch install-hooks
+
+# Run the daemon at login
+agentwatch service install
+```
+
+Then open a new agent session — hooks are read at session start, so an
+already-running session is not monitored.
+
+To see historical token usage immediately, without waiting for new sessions:
+
+```sh
+agentwatch import      # reads Claude Code's own transcripts
+agentwatch tokens --all --by project
+```
+
+Undoing all of it:
+
+```sh
+agentwatch install-hooks --uninstall
+agentwatch service uninstall
+rm -rf ~/.agentwatch          # deletes collected data
+```
+
+`install-hooks` adds its entries in their own matcher group, so hooks belonging
+to other tools are never modified and an uninstall removes exactly what was
+added. Every write shows a diff first and keeps a timestamped backup.
+
+### Menu bar (optional)
+
+```sh
+cargo build -p agentwatch-menubar --release
+```
+
+Built separately on purpose: it pulls in `tray-icon` and `winit`, about 35 extra
+crates on macOS, which is not a cost to impose on people who only use the CLI.
+
+The icon is drawn at runtime rather than shipped as an asset, as a macOS
+template image so it recolours itself for light and dark menu bars. It carries
+state: a filled aperture while collecting, two bars when paused, and a faint
+hollow ring when the daemon is not running. To see the glyphs as text:
+
+```sh
+cargo test -p agentwatch-menubar preview_the_glyphs -- --ignored --nocapture
+```
+
+## Usage
+
 ```sh
 agentwatch tokens --today
 agentwatch tokens --days 7 --by day
@@ -40,6 +98,10 @@ agentwatch export --days 7 --kind command > commands.jsonl
 
 agentwatch watch                                    # live full-screen view
 agentwatch verify                                   # re-derive totals, report drift
+
+agentwatch pause                                    # stop recording, reversibly
+agentwatch resume
+agentwatch service status
 ```
 
 `watch` is a separate surface on purpose. It owns the terminal, so it cannot be
@@ -116,6 +178,12 @@ startup — no Tokio, no SQLite. It opens the socket, writes one frame, and exit
 - Command lines are **scanned, not parsed**. `cat .env` is caught; `eval`,
   variable expansion, and heredocs are not. Anything recovered this way is
   labelled `derived` and never mixed in with tool-reported file events.
+- Collection can be paused, and can be switched off entirely by editing the
+  agent's settings. Neither is prevented — nothing running as your own user
+  could prevent it. Both are **recorded**: a pause writes `collection.paused`,
+  and hooks disappearing from the settings file writes `config.changed`. A gap
+  in the timeline should say why it is there rather than looking like an idle
+  agent.
 - Cost is not estimated. On a subscription the per-token price is a number
   nobody pays, so tokens are the headline and cost stays opt-in.
 

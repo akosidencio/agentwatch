@@ -6,10 +6,14 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 mod hook_config;
+mod install;
 mod range;
 mod render;
+mod service;
 mod sync;
 mod watch;
+
+use std::path::PathBuf;
 
 use agentwatch_storage::{ActivityFilter, Coverage, Store, TokenTotals};
 use agentwatch_types::Paths;
@@ -40,6 +44,27 @@ enum Grouping {
     Model,
     /// By calendar day in your local timezone.
     Day,
+}
+
+/// Ways to manage the background service.
+#[derive(Debug, Subcommand)]
+enum ServiceAction {
+    /// Install and start the LaunchAgent.
+    Install {
+        /// Path to the daemon binary.
+        #[arg(long)]
+        binary: Option<PathBuf>,
+        /// Show the job definition and exit without writing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Write without asking.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Stop and remove the LaunchAgent.
+    Uninstall,
+    /// Report whether the service is installed and loaded.
+    Status,
 }
 
 /// The available commands.
@@ -73,6 +98,34 @@ enum Command {
         /// Show at most this many rows in the breakdown.
         #[arg(long, default_value_t = 20)]
         limit: usize,
+    },
+    /// Add our hooks to the agent's settings, after showing the diff.
+    InstallHooks {
+        /// Path to the hook binary to register.
+        #[arg(long)]
+        binary: Option<PathBuf>,
+        /// Settings file to edit.
+        #[arg(long)]
+        settings: Option<PathBuf>,
+        /// Remove our hooks instead of adding them.
+        #[arg(long)]
+        uninstall: bool,
+        /// Write without asking.
+        #[arg(long)]
+        yes: bool,
+        /// Show the diff and exit without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Stop recording new events until resumed.
+    Pause,
+    /// Resume recording after a pause.
+    Resume,
+    /// Manage the background service.
+    Service {
+        /// What to do.
+        #[command(subcommand)]
+        action: ServiceAction,
     },
     /// Watch activity live in a full-screen view.
     Watch,
@@ -166,6 +219,16 @@ fn main() -> Result<()> {
             all,
             limit,
         } => tokens(&paths, by, days, from.as_deref(), to.as_deref(), all, limit),
+        Command::InstallHooks {
+            binary,
+            settings,
+            uninstall,
+            yes,
+            dry_run,
+        } => install_hooks(binary, settings, uninstall, yes, dry_run),
+        Command::Pause => set_paused(&paths, true),
+        Command::Resume => set_paused(&paths, false),
+        Command::Service { action } => service_command(&paths, action),
         Command::Watch => watch::run(&paths),
         Command::Sessions {
             days,
@@ -211,6 +274,9 @@ fn status(paths: &Paths) -> Result<()> {
         if running { "running" } else { "not running" }
     );
     println!("socket    {}", socket.display());
+    if paths.is_paused() {
+        println!("collection PAUSED — run `agentwatch resume` to record again");
+    }
     println!("database  {}", paths.database().display());
 
     if !paths.database().exists() {
@@ -330,6 +396,260 @@ fn print_totals(totals: &TokenTotals) {
         "  responses      {:>15}",
         render::thousands(totals.responses)
     );
+}
+
+/// Pauses or resumes collection.
+///
+/// The marker file is the whole mechanism: the daemon checks it per write
+/// batch, so a pause takes effect within a fifth of a second and survives a
+/// restart. Both transitions are recorded, so the gap it creates explains
+/// itself rather than looking like an idle agent.
+fn set_paused(paths: &Paths, paused: bool) -> Result<()> {
+    paths.ensure_root().context("creating the data directory")?;
+    let marker = paths.pause_marker();
+
+    if paused {
+        if marker.exists() {
+            println!("Already paused.");
+            return Ok(());
+        }
+        std::fs::write(&marker, "").with_context(|| format!("creating {}", marker.display()))?;
+        println!("Collection paused. Events are accepted and discarded until you resume.");
+        println!("Run `agentwatch resume` to start recording again.");
+    } else {
+        if !marker.exists() {
+            println!("Not paused.");
+            return Ok(());
+        }
+        std::fs::remove_file(&marker).with_context(|| format!("removing {}", marker.display()))?;
+        println!("Collection resumed.");
+    }
+
+    if std::os::unix::net::UnixStream::connect(paths.socket()).is_err() {
+        println!("\nThe daemon is not running, so this takes effect when it starts.");
+    }
+    Ok(())
+}
+
+/// Installs, removes, or reports on the background service.
+fn service_command(paths: &Paths, action: ServiceAction) -> Result<()> {
+    let path = service::plist_path();
+
+    match action {
+        ServiceAction::Status => {
+            println!("Job label:  {}", service::LABEL);
+            println!("Definition: {}", path.display());
+            println!("Installed:  {}", if path.exists() { "yes" } else { "no" });
+            println!(
+                "Loaded:     {}",
+                if service::is_loaded() { "yes" } else { "no" }
+            );
+            if !path.exists() {
+                println!("\nRun `agentwatch service install` to start it at login.");
+            }
+            Ok(())
+        }
+
+        ServiceAction::Install {
+            binary,
+            dry_run,
+            yes,
+        } => {
+            let binary = binary.unwrap_or_else(service::default_daemon_binary);
+            if !binary.is_file() {
+                anyhow::bail!(
+                    "no daemon binary at {}\n\
+                     Build it with `cargo build --release`, or pass --binary <path>.",
+                    binary.display()
+                );
+            }
+            let binary = binary
+                .canonicalize()
+                .with_context(|| format!("resolving {}", binary.display()))?;
+
+            let definition = service::plist(&binary, paths.root(), &environment_overrides());
+
+            println!("Job label:  {}", service::LABEL);
+            println!("Definition: {}\n", path.display());
+            print!("{definition}");
+
+            if dry_run {
+                println!("\nDry run — nothing was written.");
+                return Ok(());
+            }
+            if !yes && !confirm()? {
+                println!("\nCancelled. Nothing was written.");
+                return Ok(());
+            }
+
+            let directory = path.parent().unwrap_or(std::path::Path::new("."));
+            std::fs::create_dir_all(directory)
+                .with_context(|| format!("creating {}", directory.display()))?;
+
+            // Replacing a loaded job without unloading it first leaves launchd
+            // running the old binary, so an upgrade would silently do nothing.
+            if service::is_loaded() {
+                service::bootout().context("unloading the previous job")?;
+            }
+
+            std::fs::write(&path, definition)
+                .with_context(|| format!("writing {}", path.display()))?;
+            service::bootstrap(&path).context("loading the job")?;
+
+            println!("\nInstalled and started. It will start again at login.");
+            println!("Logs: {}/daemon.log", paths.root().display());
+            Ok(())
+        }
+
+        ServiceAction::Uninstall => {
+            if service::is_loaded() {
+                service::bootout().context("unloading the job")?;
+            }
+            if path.exists() {
+                std::fs::remove_file(&path)
+                    .with_context(|| format!("removing {}", path.display()))?;
+                println!("Removed {}.", path.display());
+            } else {
+                println!("Not installed.");
+            }
+            println!(
+                "\nStored data is untouched. Delete {} to remove it.",
+                paths.root().display()
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Environment overrides that must be carried into the launchd job.
+///
+/// launchd starts jobs with an empty environment, so any directory the user has
+/// redirected in their shell has to be written into the job definition. Missing
+/// one does not fail loudly: the service simply reads a different database, or
+/// watches a settings file nobody is using.
+fn environment_overrides() -> Vec<(&'static str, PathBuf)> {
+    ["AGENTWATCH_DIR", "CLAUDE_CONFIG_DIR"]
+        .into_iter()
+        .filter_map(|key| std::env::var_os(key).map(|value| (key, PathBuf::from(value))))
+        .collect()
+}
+
+/// Adds or removes our hooks, showing the exact diff first.
+fn install_hooks(
+    binary: Option<PathBuf>,
+    settings: Option<PathBuf>,
+    uninstall: bool,
+    assume_yes: bool,
+    dry_run: bool,
+) -> Result<()> {
+    let path = settings.unwrap_or_else(install::file::default_settings_path);
+    let current = install::file::read(&path)?;
+
+    let (updated, change) = if uninstall {
+        install::plan_uninstall(&current)
+    } else {
+        let binary = binary.unwrap_or_else(install::file::default_hook_binary);
+
+        // A hook pointing at a missing binary fails silently: the agent ignores
+        // the exit code, so monitoring would simply never start and nothing
+        // would say why.
+        if !binary.is_file() {
+            anyhow::bail!(
+                "no hook binary at {}\n\
+                 Build it with `cargo build --release`, or pass --binary <path>.",
+                binary.display()
+            );
+        }
+
+        // Hooks run with the project directory as cwd, so a relative path
+        // would resolve somewhere else entirely — or nowhere.
+        let binary = binary
+            .canonicalize()
+            .with_context(|| format!("resolving {}", binary.display()))?;
+
+        install::plan_install(&current, &binary.to_string_lossy())
+    };
+
+    let action = if uninstall { "remove" } else { "install" };
+    println!("Settings file: {}", path.display());
+
+    if change.is_empty() {
+        println!(
+            "\nNothing to {action}. {}",
+            if uninstall {
+                "Our hooks are not present."
+            } else {
+                "Our hooks are already installed."
+            }
+        );
+        return Ok(());
+    }
+
+    let before = format!("{}\n", serde_json::to_string_pretty(&current)?);
+    let after = format!("{}\n", serde_json::to_string_pretty(&updated)?);
+
+    println!(
+        "\nThis would {action} {} hook {}:\n",
+        if uninstall {
+            change.removed
+        } else {
+            change.added
+        },
+        if (if uninstall {
+            change.removed
+        } else {
+            change.added
+        }) == 1
+        {
+            "entry"
+        } else {
+            "entries"
+        }
+    );
+    print!("{}", install::unified_diff(&before, &after));
+
+    if dry_run {
+        println!("\nDry run — nothing was written.");
+        return Ok(());
+    }
+
+    if !assume_yes && !confirm()? {
+        println!("\nCancelled. Nothing was written.");
+        return Ok(());
+    }
+
+    let backup = install::file::write(&path, &updated)?;
+    println!("\nWrote {}.", path.display());
+    if let Some(backup) = backup {
+        println!("Previous version saved to {}.", backup.display());
+    }
+    if !uninstall {
+        println!("\nStart the daemon with `agentwatch-daemon`, then open a new session.");
+    }
+    Ok(())
+}
+
+/// Asks the user to approve a write.
+///
+/// A non-interactive run without `--yes` declines rather than proceeding: this
+/// edits the configuration of the agent being monitored, and a pipe is not
+/// consent.
+fn confirm() -> Result<bool> {
+    use std::io::{IsTerminal as _, Write as _};
+
+    if !std::io::stdin().is_terminal() {
+        println!("\nNot a terminal. Re-run with --yes to write, or --dry-run to inspect.");
+        return Ok(false);
+    }
+
+    print!("\nApply this change? [y/N] ");
+    std::io::stdout().flush().context("prompting")?;
+
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .context("reading your answer")?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "Yes"))
 }
 
 /// Lists sessions with their counts.

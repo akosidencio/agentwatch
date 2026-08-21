@@ -6,11 +6,13 @@
 
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
+mod format;
 mod ids;
 mod paths;
 mod repository;
 mod timestamp;
 
+pub use format::{compact, thousands};
 pub use ids::{AgentId, EventId, ExternalSessionId, ProjectId, SessionId};
 pub use paths::{DATA_DIR_ENV, PathError, Paths};
 pub use repository::{RepositoryResolver, display_name};

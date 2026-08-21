@@ -67,6 +67,23 @@ impl Paths {
         self.root.join("agentwatch.db")
     }
 
+    /// Marker whose presence means collection is paused.
+    ///
+    /// A file rather than a socket command because the daemon's socket carries
+    /// events in one direction only, and because a pause should survive a
+    /// daemon restart — a pause that quietly lifts itself is worse than no
+    /// pause at all.
+    #[must_use]
+    pub fn pause_marker(&self) -> PathBuf {
+        self.root.join("paused")
+    }
+
+    /// Whether collection is currently paused.
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        self.pause_marker().exists()
+    }
+
     /// Creates the data directory if it does not exist.
     ///
     /// # Errors

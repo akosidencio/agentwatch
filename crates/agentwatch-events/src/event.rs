@@ -148,6 +148,12 @@ pub enum Event {
     /// A model response's token usage.
     #[serde(rename = "token.usage")]
     TokenUsage(TokenUsageEvent),
+    /// Collection was paused or resumed by the user.
+    #[serde(rename = "collection")]
+    Collection(CollectionEvent),
+    /// Our own hook configuration changed underneath us.
+    #[serde(rename = "config.changed")]
+    ConfigChanged(ConfigChangedEvent),
     /// The agent reported something this version does not model yet.
     #[serde(rename = "unknown")]
     Unknown(UnknownEvent),
@@ -170,6 +176,14 @@ impl Event {
             Self::McpCall(_) => "mcp.call",
             Self::ToolCall(_) => "tool.call",
             Self::TokenUsage(_) => "token.usage",
+            Self::Collection(collection) => {
+                if collection.paused {
+                    "collection.paused"
+                } else {
+                    "collection.resumed"
+                }
+            }
+            Self::ConfigChanged(_) => "config.changed",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -303,6 +317,40 @@ impl TokenUsageEvent {
     pub const fn total(&self) -> u64 {
         self.total_input().saturating_add(self.output_tokens)
     }
+}
+
+/// Collection was deliberately stopped or restarted.
+///
+/// Recorded so that the resulting hole in the timeline explains itself. A
+/// monitor that can be silenced without the silence being visible is only
+/// telling you what someone was willing to let you see.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollectionEvent {
+    /// Whether collection is paused as of this event.
+    pub paused: bool,
+}
+
+/// The monitored agent's hook configuration changed.
+///
+/// Recorded because a monitor whose own collection can be switched off without
+/// trace is not much of a monitor. The common cause is benign — a reinstall, a
+/// co-installed tool rewriting the file — so this is evidence, not an
+/// accusation. What matters is that the gap is visible afterwards.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigChangedEvent {
+    /// Settings file that changed.
+    pub path: String,
+    /// Whether our hooks are present now.
+    ///
+    /// The interesting transition is `true` to `false`: monitoring stopped and
+    /// every later silence in the timeline is explained by this, not by an idle
+    /// agent.
+    pub hooks_present: bool,
+    /// Fingerprint of the hook configuration after the change.
+    pub fingerprint: String,
+    /// Fingerprint before, when we had seen this file before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_fingerprint: Option<String>,
 }
 
 /// Something the agent reported that this version does not model.
