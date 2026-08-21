@@ -178,6 +178,19 @@ fn insert_one(transaction: &Transaction<'_>, event: &AgentEvent) -> Result<usize
     )?;
 
     if inserted == 0 {
+        // Adapter upgrades can discover relationship metadata that an older
+        // import did not know about. Repairing this one session attribute is
+        // safe even when the append-only event itself is already present.
+        if let (Some(session_id), Some(parent_session_id)) =
+            (event.session_id, event.parent_session_id)
+        {
+            transaction.execute(
+                "UPDATE sessions
+                    SET parent_session_id = COALESCE(parent_session_id, ?2)
+                  WHERE id = ?1",
+                params![session_id.to_string(), parent_session_id.to_string()],
+            )?;
+        }
         return Ok(0);
     }
 
@@ -410,14 +423,15 @@ fn upsert_session(
 
     transaction.execute(
         "INSERT INTO sessions
-            (id, agent_id, external_session_id, project_id, started_at_us, status, transcript_path, created_at_us, git_branch, surface)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?9, ?6, ?7, ?8, ?10)
+            (id, agent_id, external_session_id, project_id, started_at_us, status, transcript_path, created_at_us, git_branch, surface, parent_session_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?9, ?6, ?7, ?8, ?10, ?11)
          ON CONFLICT(id) DO UPDATE SET
             started_at_us   = MIN(COALESCE(started_at_us, excluded.started_at_us), excluded.started_at_us),
             project_id      = COALESCE(sessions.project_id, excluded.project_id),
             transcript_path = COALESCE(excluded.transcript_path, sessions.transcript_path),
             git_branch      = COALESCE(excluded.git_branch, sessions.git_branch),
             surface         = COALESCE(excluded.surface, sessions.surface),
+            parent_session_id = COALESCE(excluded.parent_session_id, sessions.parent_session_id),
             status          = CASE
                                 WHEN excluded.status = 'active' THEN 'active'
                                 WHEN sessions.status = 'unknown' THEN excluded.status
@@ -434,6 +448,7 @@ fn upsert_session(
             event.git_branch.as_deref(),
             status,
             event.surface.as_deref(),
+            event.parent_session_id.map(|id| id.to_string()),
         ],
     )?;
 

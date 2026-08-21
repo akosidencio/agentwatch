@@ -19,6 +19,12 @@ pub struct AgentEvent {
     pub session_id: Option<SessionId>,
     /// The agent's own session identifier, kept for cross-referencing.
     pub external_session_id: Option<ExternalSessionId>,
+    /// Parent session for a spawned agent, when the source reports one.
+    ///
+    /// The child keeps its own session identity so its lifecycle cannot mark
+    /// the parent ended. Storage uses this relationship when a parent receipt
+    /// rolls child activity into its detailed sections.
+    pub parent_session_id: Option<SessionId>,
     /// Project the session was working in, derived from its working directory.
     pub project_id: Option<ProjectId>,
     /// The working directory itself.
@@ -55,6 +61,7 @@ impl AgentEvent {
             agent_id,
             session_id: None,
             external_session_id: None,
+            parent_session_id: None,
             project_id: None,
             project_path: None,
             git_branch: None,
@@ -70,6 +77,15 @@ impl AgentEvent {
     pub fn with_session(mut self, external: ExternalSessionId) -> Self {
         self.session_id = Some(SessionId::from_external(&self.agent_id, &external));
         self.external_session_id = Some(external);
+        self
+    }
+
+    /// Attaches a spawned agent's parent session identity.
+    #[must_use]
+    pub fn with_parent_session(mut self, external: Option<ExternalSessionId>) -> Self {
+        self.parent_session_id = external
+            .as_ref()
+            .map(|external| SessionId::from_external(&self.agent_id, external));
         self
     }
 

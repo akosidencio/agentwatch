@@ -98,6 +98,8 @@ struct Items {
     pause: MenuItem,
     /// Open the live view in a terminal.
     dashboard: MenuItem,
+    /// Open the newest main-agent session receipt in a terminal.
+    receipt: MenuItem,
     /// Quit this status item.
     quit: MenuItem,
 }
@@ -122,7 +124,8 @@ impl App {
             sessions: MenuItem::new("Sessions today: —", false, None),
             sensitive: MenuItem::new("Sensitive access: —", false, None),
             pause: MenuItem::new("Pause collection", true, None),
-            dashboard: MenuItem::new("Open live view", true, None),
+            dashboard: MenuItem::new("Open live dashboard", true, None),
+            receipt: MenuItem::new("Open latest session receipt", true, None),
             quit: MenuItem::new("Quit AgentWatch menu", true, None),
         };
 
@@ -135,6 +138,7 @@ impl App {
         menu.append(&PredefinedMenuItem::separator())?;
         menu.append(&items.pause)?;
         menu.append(&items.dashboard)?;
+        menu.append(&items.receipt)?;
         menu.append(&PredefinedMenuItem::separator())?;
         menu.append(&items.quit)?;
 
@@ -201,7 +205,9 @@ impl App {
             self.last = None;
             self.refresh();
         } else if id == items.dashboard.id() {
-            open_live_view(&self.paths);
+            open_in_terminal(&self.paths, &["watch"]);
+        } else if id == items.receipt.id() {
+            open_in_terminal(&self.paths, &["session", "latest"]);
         }
     }
 }
@@ -238,12 +244,7 @@ impl ApplicationHandler for App {
 
 /// Runs an `agentwatch` subcommand, ignoring failure.
 fn run_cli(paths: &Paths, command: &str) -> Result<()> {
-    let binary = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|directory| directory.join("agentwatch")))
-        .unwrap_or_else(|| "agentwatch".into());
-
-    std::process::Command::new(binary)
+    std::process::Command::new(cli_binary())
         .arg(command)
         .env("AGENTWATCH_DIR", paths.root())
         .output()
@@ -251,30 +252,81 @@ fn run_cli(paths: &Paths, command: &str) -> Result<()> {
     Ok(())
 }
 
-/// Opens the live view in Terminal.
-///
-/// `agentwatch watch` owns a terminal, so it needs one opened for it rather
-/// than being spawned headless where its output would go nowhere.
-fn open_live_view(paths: &Paths) {
-    let binary = std::env::current_exe()
+/// Resolves the CLI installed beside the menu bar executable.
+fn cli_binary() -> std::path::PathBuf {
+    std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(|directory| directory.join("agentwatch")))
-        .unwrap_or_else(|| "agentwatch".into());
+        .unwrap_or_else(|| "agentwatch".into())
+}
 
-    let script = format!(
-        "tell application \"Terminal\" to do script \"AGENTWATCH_DIR={} {} watch\"\n\
-         tell application \"Terminal\" to activate",
-        shell_quote(&paths.root().display().to_string()),
-        shell_quote(&binary.display().to_string()),
-    );
-
+/// Opens an interactive or printable CLI surface in Terminal.
+///
+/// `agentwatch watch` owns a terminal, and a receipt should remain visible at
+/// a shell prompt after it prints. Neither belongs in a headless child process.
+fn open_in_terminal(paths: &Paths, arguments: &[&str]) {
+    let script = terminal_script(paths, &cli_binary(), arguments);
     let _ = std::process::Command::new("osascript")
         .arg("-e")
         .arg(script)
         .output();
 }
 
+/// Builds the AppleScript used to open one CLI command in Terminal.
+fn terminal_script(paths: &Paths, binary: &std::path::Path, arguments: &[&str]) -> String {
+    let arguments = arguments
+        .iter()
+        .map(|argument| shell_quote(argument))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let separator = if arguments.is_empty() { "" } else { " " };
+    format!(
+        "tell application \"Terminal\" to do script \"AGENTWATCH_DIR={} {}{separator}{arguments}\"\n\
+         tell application \"Terminal\" to activate",
+        shell_quote(&paths.root().display().to_string()),
+        shell_quote(&binary.display().to_string()),
+    )
+}
+
 /// Quotes a path for inclusion in a shell command inside AppleScript.
 fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+
+    #[test]
+    fn live_dashboard_runs_the_sibling_binary_with_the_data_directory() {
+        let paths = Paths::with_root("/tmp/Agent Watch");
+        let script = terminal_script(&paths, Path::new("/Applications/Agent Watch"), &["watch"]);
+
+        assert!(
+            script.contains("AGENTWATCH_DIR='/tmp/Agent Watch'"),
+            "{script}"
+        );
+        assert!(
+            script.contains("'/Applications/Agent Watch' 'watch'"),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn latest_receipt_gets_its_own_terminal_command() {
+        let paths = Paths::with_root("/tmp/agentwatch");
+        let script = terminal_script(
+            &paths,
+            Path::new("/usr/local/bin/agentwatch"),
+            &["session", "latest"],
+        );
+
+        assert!(
+            script.contains("'/usr/local/bin/agentwatch' 'session' 'latest'"),
+            "{script}"
+        );
+        assert!(!script.contains(" watch"), "{script}");
+    }
 }

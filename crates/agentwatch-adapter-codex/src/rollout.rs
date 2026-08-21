@@ -141,6 +141,7 @@ pub fn read_rollout_from<R: BufRead>(
 struct State {
     session: Option<ExternalSessionId>,
     session_id_text: Option<String>,
+    parent_session: Option<ExternalSessionId>,
     project: Option<String>,
     model: Option<String>,
     effort: Option<String>,
@@ -163,6 +164,10 @@ impl State {
         match payload {
             Payload::SessionMeta(meta) => {
                 self.is_subagent = meta.source.as_ref().is_some_and(Source::is_subagent);
+                self.parent_session = meta
+                    .session_id
+                    .filter(|session_id| session_id != &meta.id)
+                    .map(ExternalSessionId::from);
                 self.session_id_text = Some(meta.id.clone());
                 self.session = Some(ExternalSessionId::from(meta.id));
                 self.project = Some(meta.cwd);
@@ -321,7 +326,8 @@ impl State {
             AgentEvent::observed(AgentId::CODEX, EvidenceSource::Transcript, event)
                 .with_id(EventId::from_key(&AgentId::CODEX, &key))
                 .at(timestamp)
-                .with_surface(self.surface.clone());
+                .with_surface(self.surface.clone())
+                .with_parent_session(self.parent_session.clone());
         if let Some(session) = self.session.clone() {
             normalized = normalized.with_session(session);
         }
@@ -369,6 +375,8 @@ enum Payload {
 #[derive(Debug, Deserialize)]
 struct SessionMeta {
     id: String,
+    #[serde(default)]
+    session_id: Option<String>,
     cwd: String,
     #[serde(default)]
     originator: Option<String>,
@@ -511,6 +519,8 @@ fn exec_calls(input: &str) -> Vec<ExecCall> {
 mod tests {
     use std::io::Cursor;
 
+    use agentwatch_types::SessionId;
+
     use super::*;
 
     const ROLLOUT: &str = r#"
@@ -575,5 +585,42 @@ mod tests {
             summary.responses, 2,
             "only the repeated cumulative snapshot is a duplicate"
         );
+    }
+
+    #[test]
+    fn links_a_subagent_thread_to_its_parent_without_merging_lifecycles() {
+        let text = r#"
+{"timestamp":"2026-08-21T12:00:00Z","type":"session_meta","payload":{"id":"child-thread","session_id":"parent-thread","cwd":"/work","source":{"subagent":{"other":"reviewer"}},"thread_source":"subagent"}}
+{"timestamp":"2026-08-21T12:00:01Z","type":"turn_context","payload":{"model":"gpt-5.6-sol"}}
+{"timestamp":"2026-08-21T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}}
+"#;
+        let (events, _) = read_rollout_from(Cursor::new(text), None).expect("read");
+        let expected_parent = SessionId::from_external(
+            &AgentId::CODEX,
+            &ExternalSessionId::from("parent-thread".to_owned()),
+        );
+        let expected_child = SessionId::from_external(
+            &AgentId::CODEX,
+            &ExternalSessionId::from("child-thread".to_owned()),
+        );
+
+        assert!(
+            events
+                .iter()
+                .all(|event| event.session_id == Some(expected_child))
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.parent_session_id == Some(expected_parent))
+        );
+        let usage = events
+            .iter()
+            .find_map(|event| match &event.event {
+                Event::TokenUsage(usage) => Some(usage),
+                _ => None,
+            })
+            .expect("usage");
+        assert!(usage.is_subagent);
     }
 }

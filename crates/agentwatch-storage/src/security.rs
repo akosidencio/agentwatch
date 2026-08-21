@@ -22,9 +22,9 @@ pub struct Notable {
 }
 
 /// File events and command references are unioned but kept distinguishable by
-/// `evidence`: a tool-reported read is observation, a path scraped out of a
-/// command line is inference, and the difference matters when someone acts on
-/// this list.
+/// `evidence`: a tool-reported read carries its adapter source (`hook` or
+/// `transcript`), while a path scraped out of a command line is `derived`.
+/// The difference matters when someone acts on this list.
 impl Store {
     /// Lists everything above `normal` in a range, most serious first.
     ///
@@ -45,9 +45,10 @@ impl Store {
             "SELECT timestamp_us, sensitivity, kind, path, evidence, project
            FROM (
              SELECT f.timestamp_us AS timestamp_us, f.sensitivity AS sensitivity,
-                    f.operation AS kind, f.path AS path, 'hook' AS evidence,
+                    f.operation AS kind, f.path AS path, e.evidence AS evidence,
                     COALESCE(r.root, p.path) AS project
                FROM file_events f
+               JOIN events e       ON e.id = f.id
                LEFT JOIN projects p     ON p.id = f.project_id
                LEFT JOIN repositories r ON r.id = p.repository_id
               WHERE f.sensitivity != 'normal'

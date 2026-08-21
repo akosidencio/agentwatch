@@ -311,7 +311,15 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
                COALESCE(ended_at_us, started_at_us, created_at_us), 0
           FROM sessions
          WHERE project_id IS NOT NULL;
-    ",
+        ",
+    },
+    Migration {
+        version: 10,
+        name: "subagent_parent_sessions",
+        sql: r"
+        ALTER TABLE sessions ADD COLUMN parent_session_id TEXT;
+        CREATE INDEX sessions_parent ON sessions (parent_session_id);
+        ",
     },
 ];
 

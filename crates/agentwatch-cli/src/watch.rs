@@ -41,6 +41,10 @@ const FEED_LENGTH: u32 = 200;
 
 /// Everything the view draws.
 struct Dashboard {
+    /// Zone used to render event clocks.
+    zone: range::Zone,
+    /// Whether `zone` is the machine's local zone rather than the UTC fallback.
+    local_time: bool,
     /// Today's token counts.
     totals: TokenTotals,
     /// Sessions seen today, newest first.
@@ -99,10 +103,12 @@ fn event_loop(
 
 /// Reads the current state of the world.
 fn snapshot(store: &Store, paths: &Paths) -> Result<Dashboard> {
-    let (zone, _) = range::local_zone();
+    let (zone, local_time) = range::local_zone();
     let today = range::last_days(1, zone);
 
     Ok(Dashboard {
+        zone,
+        local_time,
         totals: store
             .token_totals(today.from_us, today.to_us)
             .context("reading totals")?,
@@ -196,7 +202,9 @@ fn draw_header(frame: &mut ratatui::Frame<'_>, area: Rect, dashboard: &Dashboard
     ]);
 
     frame.render_widget(
-        Paragraph::new(line).block(panel("agentwatch — q to quit")),
+        Paragraph::new(line).block(panel(
+            "agentwatch — q quit · full receipt: agentwatch session latest",
+        )),
         area,
     );
 }
@@ -237,6 +245,7 @@ fn draw_sessions(frame: &mut ratatui::Frame<'_>, area: Rect, dashboard: &Dashboa
                 },
                 session.status
             ),
+            session.model.as_deref().unwrap_or("?").to_owned(),
             // Right-aligned by padding: ratatui left-aligns every cell, and a
             // ragged column of numbers cannot be compared down the page.
             format!("{:>13}", render::thousands(session.tokens)),
@@ -263,6 +272,7 @@ fn draw_sessions(frame: &mut ratatui::Frame<'_>, area: Rect, dashboard: &Dashboa
         [
             Constraint::Length(9),
             Constraint::Length(10),
+            Constraint::Length(20),
             Constraint::Length(14),
             Constraint::Length(5),
             Constraint::Length(5),
@@ -275,6 +285,7 @@ fn draw_sessions(frame: &mut ratatui::Frame<'_>, area: Rect, dashboard: &Dashboa
         Row::new(vec![
             "session".to_owned(),
             "status".to_owned(),
+            "model".to_owned(),
             format!("{:>13}", "tokens"),
             format!("{:>4}", "cmd"),
             format!("{:>4}", "file"),
@@ -300,7 +311,8 @@ fn draw_feed(frame: &mut ratatui::Frame<'_>, area: Rect, dashboard: &Dashboard) 
             // Spans rather than one style for the whole line: the timestamp
             // and the project are chrome on every row, and colouring them the
             // same as the kind makes a busy feed unreadable.
-            let segments = render::event_segments(row);
+            let mut segments = render::event_segments(row);
+            segments.time = dashboard.zone.clock_time(row.timestamp_us);
             let kind_style =
                 render::kind_colour(&segments.kind).map_or_else(Style::default, theme::style);
 
@@ -324,7 +336,14 @@ fn draw_feed(frame: &mut ratatui::Frame<'_>, area: Rect, dashboard: &Dashboard) 
         })
         .collect();
 
-    frame.render_widget(List::new(items).block(panel("activity")), area);
+    frame.render_widget(
+        List::new(items).block(panel(if dashboard.local_time {
+            "activity · local time"
+        } else {
+            "activity · UTC"
+        })),
+        area,
+    );
 }
 
 /// Takes over the terminal.
@@ -395,6 +414,8 @@ mod tests {
 
     fn dashboard(daemon_running: bool, notable: usize) -> Dashboard {
         Dashboard {
+            zone: range::Zone::fixed(time::UtcOffset::UTC),
+            local_time: true,
             totals: TokenTotals {
                 input: 10,
                 cache_creation: 20,
@@ -452,6 +473,7 @@ mod tests {
             "the session id should be shown"
         );
         assert!(output.contains("acme"), "the project should be shown");
+        assert!(output.contains("claude-opus"), "the model should be shown");
     }
 
     #[test]
@@ -466,6 +488,8 @@ mod tests {
     #[test]
     fn survives_an_empty_database() {
         let empty = Dashboard {
+            zone: range::Zone::fixed(time::UtcOffset::UTC),
+            local_time: true,
             totals: TokenTotals::default(),
             sessions: Vec::new(),
             feed: Vec::new(),

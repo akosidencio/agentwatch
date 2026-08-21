@@ -21,7 +21,7 @@ mod welcome;
 use std::path::PathBuf;
 
 use agentwatch_storage::{ActivityFilter, Coverage, SessionFilter, Store, TokenTotals};
-use agentwatch_types::Paths;
+use agentwatch_types::{Paths, Timestamp};
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 
@@ -415,6 +415,7 @@ fn main() -> Result<()> {
             ActivityFilter {
                 agent,
                 session,
+                include_subagents: false,
                 project_prefix: project,
                 kinds: kind,
             },
@@ -955,7 +956,7 @@ fn sessions(
     Ok(())
 }
 
-/// Prints a compact receipt for one session.
+/// Prints a complete receipt for one session.
 fn session(paths: &Paths, reference: &str) -> Result<()> {
     let store = open_for_reading(paths)?;
     let candidates = store
@@ -985,24 +986,155 @@ fn session(paths: &Paths, reference: &str) -> Result<()> {
     );
     let row = &matches[0];
 
-    println!("Session receipt");
-    println!();
-    println!("{}", render::session_header());
-    println!("{}", render::session_line(row));
-
+    // Query every section before printing. If the database is damaged or from
+    // an incompatible build, the command fails cleanly instead of leaving a
+    // plausible-looking partial receipt on stdout.
     let projects = store
         .projects_for_session(&row.id)
         .context("reading session projects")?;
-    if projects.len() > 1 {
-        println!();
-        println!("Projects touched:");
+    let tokens = store
+        .receipt_tokens(&row.id)
+        .context("reading session token breakdown")?;
+    let files = store
+        .receipt_files(&row.id)
+        .context("reading session files")?;
+    let commands = store
+        .receipt_commands(&row.id)
+        .context("reading session commands")?;
+    let notable = store
+        .receipt_notable_access(&row.id)
+        .context("reading session sensitive access")?;
+    let timeline = store
+        .activity(
+            0,
+            i64::MAX,
+            &ActivityFilter {
+                session: Some(row.id.clone()),
+                include_subagents: true,
+                ..ActivityFilter::default()
+            },
+            u32::MAX,
+        )
+        .context("reading session timeline")?;
+    let coverage = store.coverage(&row.id).context("reading coverage")?;
+
+    let started = row.started_at_us.map_or_else(
+        || "unknown".to_owned(),
+        |micros| Timestamp::from_micros(micros).to_rfc3339(),
+    );
+    let duration_ms = row.duration_ms.or_else(|| {
+        (row.status == "active").then(|| {
+            row.started_at_us
+                .map(|started| (Timestamp::now().as_micros() - started).max(0) / 1_000)
+        })?
+    });
+    let duration = duration_ms.map_or_else(
+        || "unknown".to_owned(),
+        |milliseconds| {
+            let formatted = render::format_duration(milliseconds);
+            if row.status == "active" {
+                format!("{formatted} (running)")
+            } else {
+                formatted
+            }
+        },
+    );
+
+    println!("Session receipt {}", row.id);
+    println!();
+    println!("  agent      {}", row.agent_id);
+    println!(
+        "  role       {}",
+        if row.is_subagent { "subagent" } else { "main" }
+    );
+    println!("  status     {}", row.status);
+    println!("  started    {started}");
+    println!("  duration   {duration}");
+    println!(
+        "  branch     {}",
+        row.git_branch.as_deref().unwrap_or("unknown")
+    );
+    println!(
+        "  surface    {}",
+        row.surface.as_deref().unwrap_or("unknown")
+    );
+
+    println!();
+    println!("Projects touched ({})", projects.len());
+    if projects.is_empty() {
+        println!("  None observed.");
+    } else {
         for project in projects {
             println!("  {project}");
         }
     }
 
     println!();
-    print_coverage(&store.coverage(&row.id).context("reading coverage")?);
+    println!("Tokens by model and role ({})", tokens.len());
+    if tokens.is_empty() {
+        println!("  None observed.");
+    } else {
+        println!("{}", render::receipt_token_header());
+        for group in &tokens {
+            println!("{}", render::receipt_token_line(group));
+        }
+    }
+
+    println!();
+    println!("Files touched ({})", files.len());
+    if files.is_empty() {
+        println!("  None observed.");
+    } else {
+        println!("{}", render::receipt_file_header());
+        for file in &files {
+            println!("{}", render::receipt_file_line(file));
+        }
+    }
+
+    println!();
+    println!("Commands executed ({})", commands.len());
+    if commands.is_empty() {
+        println!("  None observed.");
+    } else {
+        println!("{}", render::receipt_command_header());
+        for command in &commands {
+            println!("{}", render::receipt_command_line(command));
+        }
+    }
+
+    println!();
+    println!("Sensitive access ({})", notable.len());
+    if notable.is_empty() {
+        println!("  None observed.");
+    } else {
+        println!("{}", render::notable_header());
+        for access in &notable {
+            println!("{}", render::notable_line(access));
+        }
+    }
+    println!();
+    println!("{}", render::SECURITY_CAVEAT);
+
+    println!();
+    println!("Timeline ({} events)", timeline.len());
+    if timeline.is_empty() {
+        println!("  Nothing recorded.");
+    } else {
+        println!("{}", render::header());
+        for event in &timeline {
+            println!("{}", render::event_line_painted(event));
+        }
+    }
+
+    println!();
+    println!("Coverage");
+    print_coverage(&coverage);
+
+    println!();
+    println!("Coverage gaps");
+    for gap in render::coverage_gaps(&row.agent_id, row.git_branch.is_some()) {
+        println!("  {gap}");
+    }
     Ok(())
 }
 
@@ -1257,4 +1389,171 @@ fn events(paths: &Paths, limit: u32) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod session_receipt_tests {
+    use std::io::Cursor;
+
+    use agentwatch_adapter_claude::{ClaudeAdapter, read_token_usage_from};
+    use agentwatch_adapter_codex::read_rollout_from;
+    use agentwatch_events::{HookAdapter, HookEnvelope};
+
+    use super::*;
+
+    fn claude_hook(payload: serde_json::Value, timestamp_us: i64) -> agentwatch_events::AgentEvent {
+        let envelope: HookEnvelope = serde_json::from_value(serde_json::json!({
+            "v": 1,
+            "source": "claude-code",
+            "sent_at": timestamp_us,
+            "hook_version": "test",
+            "payload": payload,
+        }))
+        .expect("envelope");
+        ClaudeAdapter::new()
+            .normalize(&envelope)
+            .expect("normalize hook")
+    }
+
+    #[test]
+    fn claude_receipt_combines_hooks_transcript_models_and_sidechains() {
+        let mut store = Store::open_in_memory().expect("schema");
+        let hooks = [
+            claude_hook(
+                serde_json::json!({
+                    "hook_event_name": "SessionStart",
+                    "session_id": "claude-receipt",
+                    "cwd": "/work/claude",
+                    "source": "startup"
+                }),
+                1,
+            ),
+            claude_hook(
+                serde_json::json!({
+                    "hook_event_name": "PostToolUse",
+                    "session_id": "claude-receipt",
+                    "cwd": "/work/claude",
+                    "tool_name": "Read",
+                    "tool_input": {"file_path": "/Users/dev/.aws/credentials"}
+                }),
+                2,
+            ),
+            claude_hook(
+                serde_json::json!({
+                    "hook_event_name": "PostToolUse",
+                    "session_id": "claude-receipt",
+                    "cwd": "/work/claude",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "cargo test", "description": "tests"}
+                }),
+                3,
+            ),
+            claude_hook(
+                serde_json::json!({
+                    "hook_event_name": "PostToolUse",
+                    "session_id": "claude-receipt",
+                    "cwd": "/work/claude",
+                    "tool_name": "mcp__github__search",
+                    "tool_input": {}
+                }),
+                4,
+            ),
+            claude_hook(
+                serde_json::json!({
+                    "hook_event_name": "SessionEnd",
+                    "session_id": "claude-receipt",
+                    "cwd": "/work/claude",
+                    "reason": "complete"
+                }),
+                5,
+            ),
+        ];
+        store.insert_events(&hooks).expect("hooks");
+
+        let transcript = r#"
+{"type":"assistant","timestamp":"2026-08-20T17:22:02.051Z","sessionId":"claude-receipt","cwd":"/work/claude","gitBranch":"main","entrypoint":"claude-vscode","isSidechain":false,"message":{"id":"main-response","model":"claude-main","usage":{"input_tokens":10,"output_tokens":5}}}
+{"type":"assistant","timestamp":"2026-08-20T17:22:03.051Z","sessionId":"claude-receipt","cwd":"/work/claude","gitBranch":"main","entrypoint":"claude-vscode","isSidechain":true,"message":{"id":"child-response","model":"claude-child","usage":{"input_tokens":4,"output_tokens":3}}}
+"#;
+        let (usage, _) = read_token_usage_from(Cursor::new(transcript)).expect("transcript");
+        store.insert_events(&usage).expect("usage");
+
+        let session = store
+            .sessions(0, i64::MAX, 10)
+            .expect("sessions")
+            .into_iter()
+            .find(|session| session.agent_id == "claude-code")
+            .expect("Claude session");
+        let tokens = store.receipt_tokens(&session.id).expect("tokens");
+        let files = store.receipt_files(&session.id).expect("files");
+        let commands = store.receipt_commands(&session.id).expect("commands");
+        let notable = store.receipt_notable_access(&session.id).expect("notable");
+        let coverage = store.coverage(&session.id).expect("coverage");
+
+        assert_eq!(session.git_branch.as_deref(), Some("main"));
+        assert_eq!(session.surface.as_deref(), Some("claude-vscode"));
+        assert!(tokens.iter().any(|group| !group.is_subagent));
+        assert!(tokens.iter().any(|group| group.is_subagent));
+        assert_eq!((files.len(), files[0].reads, files[0].writes), (1, 1, 0));
+        assert_eq!(commands[0].command, "cargo test");
+        assert_eq!(notable[0].evidence, "hook");
+        assert!(coverage.tokens && coverage.files && coverage.commands && coverage.mcp);
+    }
+
+    #[test]
+    fn codex_receipt_rolls_separate_child_rollout_activity_into_the_parent() {
+        let mut store = Store::open_in_memory().expect("schema");
+        let main = r#"
+{"timestamp":"2026-08-21T12:00:00Z","type":"session_meta","payload":{"id":"codex-main","session_id":"codex-main","cwd":"/work/codex","originator":"codex_vscode","source":"vscode"}}
+{"timestamp":"2026-08-21T12:00:01Z","type":"turn_context","payload":{"model":"gpt-main"}}
+{"timestamp":"2026-08-21T12:00:02Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"tools.exec_command({\"cmd\":\"cargo test\",\"workdir\":\"/work/codex\"})"}}
+{"timestamp":"2026-08-21T12:00:03Z","type":"event_msg","payload":{"type":"patch_apply_end","success":true,"changes":{"/work/codex/src/main.rs":{"type":"update"}}}}
+{"timestamp":"2026-08-21T12:00:04Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}}
+"#;
+        let child = r#"
+{"timestamp":"2026-08-21T12:00:05Z","type":"session_meta","payload":{"id":"codex-child","session_id":"codex-main","cwd":"/work/codex","source":{"subagent":{"other":"reviewer"}},"thread_source":"subagent"}}
+{"timestamp":"2026-08-21T12:00:06Z","type":"turn_context","payload":{"model":"gpt-reviewer"}}
+{"timestamp":"2026-08-21T12:00:07Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"tools.exec_command({\"cmd\":\"cargo clippy\",\"workdir\":\"/work/codex\"})"}}
+{"timestamp":"2026-08-21T12:00:08Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":20,"output_tokens":8,"total_tokens":28}}}}
+"#;
+        let (mut events, _) = read_rollout_from(Cursor::new(main), None).expect("main rollout");
+        let (child_events, _) = read_rollout_from(Cursor::new(child), None).expect("child rollout");
+        events.extend(child_events);
+        store.insert_events(&events).expect("events");
+
+        let parent = store
+            .sessions(0, i64::MAX, 10)
+            .expect("sessions")
+            .into_iter()
+            .find(|session| !session.is_subagent)
+            .expect("parent");
+        let tokens = store.receipt_tokens(&parent.id).expect("tokens");
+        let commands = store.receipt_commands(&parent.id).expect("commands");
+        let timeline = store
+            .activity(
+                0,
+                i64::MAX,
+                &ActivityFilter {
+                    session: Some(parent.id.clone()),
+                    include_subagents: true,
+                    ..ActivityFilter::default()
+                },
+                u32::MAX,
+            )
+            .expect("timeline");
+
+        assert!(tokens.iter().any(|group| group.model == "gpt-main"));
+        assert!(
+            tokens
+                .iter()
+                .any(|group| { group.model == "gpt-reviewer" && group.is_subagent })
+        );
+        assert_eq!(commands.len(), 2);
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.command == "cargo clippy")
+        );
+        assert!(timeline.iter().any(|event| event.kind == "file.write"));
+        assert!(timeline.len() >= events.len());
+    }
 }

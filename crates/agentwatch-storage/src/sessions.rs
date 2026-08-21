@@ -81,6 +81,8 @@ pub struct ActivityFilter {
     pub agent: Option<String>,
     /// Restrict to one session.
     pub session: Option<String>,
+    /// Include sessions spawned by the selected parent session.
+    pub include_subagents: bool,
     /// Restrict to event kinds.
     pub kinds: Vec<String>,
     /// Restrict to a repository or project path, matched as a prefix.
@@ -141,10 +143,11 @@ impl Store {
                           LIMIT 1),
                         r.root, p.path),
                     (SELECT COUNT(*) FROM session_projects WHERE session_id = s.id),
-                    EXISTS(SELECT 1 FROM token_usage
-                            WHERE session_id = s.id AND is_subagent = 1)
-                    AND NOT EXISTS(SELECT 1 FROM token_usage
-                                    WHERE session_id = s.id AND is_subagent = 0),
+                    s.parent_session_id IS NOT NULL
+                    OR (EXISTS(SELECT 1 FROM token_usage
+                                WHERE session_id = s.id AND is_subagent = 1)
+                        AND NOT EXISTS(SELECT 1 FROM token_usage
+                                        WHERE session_id = s.id AND is_subagent = 0)),
                     s.git_branch,
                     s.surface,
                     s.started_at_us,
@@ -164,8 +167,14 @@ impl Store {
                FROM sessions s
                LEFT JOIN repositories r ON r.id = s.repository_id
                LEFT JOIN projects p     ON p.id = s.project_id
-              WHERE COALESCE(s.started_at_us, 0) >= ?1
-                AND COALESCE(s.started_at_us, 0) < ?2",
+              WHERE ((COALESCE(s.started_at_us, 0) >= ?1
+                     AND COALESCE(s.started_at_us, 0) < ?2)
+                 OR EXISTS (
+                    SELECT 1
+                      FROM events ranged_event
+                     WHERE ranged_event.session_id = s.id
+                       AND ranged_event.timestamp_us >= ?1
+                       AND ranged_event.timestamp_us < ?2))",
         );
 
         let mut bindings: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(from_us), Box::new(to_us)];
@@ -226,14 +235,27 @@ impl Store {
     /// Returns an error if the database cannot be queried.
     pub fn coverage(&self, session_id: &str) -> Result<Coverage, StoreError> {
         let coverage = self.connection().query_row(
-            "SELECT (SELECT COUNT(*) FROM token_usage WHERE session_id = ?1) > 0,
+            "WITH RECURSIVE receipt_sessions(id) AS (
+                 SELECT ?1
+                 UNION
+                 SELECT s.id
+                   FROM sessions s
+                   JOIN receipt_sessions parent ON s.parent_session_id = parent.id
+             )
+             SELECT (SELECT COUNT(*) FROM token_usage
+                      WHERE session_id IN (SELECT id FROM receipt_sessions)) > 0,
                     (SELECT COUNT(*) FROM events
-                       WHERE session_id = ?1 AND kind = 'session.started') > 0,
+                       WHERE session_id IN (SELECT id FROM receipt_sessions)
+                         AND kind = 'session.started') > 0,
                     (SELECT COUNT(*) FROM events
-                       WHERE session_id = ?1 AND kind IN ('tool.call','file.read','file.write','command','mcp.call')) > 0,
-                    (SELECT COUNT(*) FROM command_events WHERE session_id = ?1) > 0,
-                    (SELECT COUNT(*) FROM file_events    WHERE session_id = ?1) > 0,
-                    (SELECT COUNT(*) FROM mcp_events     WHERE session_id = ?1) > 0",
+                       WHERE session_id IN (SELECT id FROM receipt_sessions)
+                         AND kind IN ('tool.call','file.read','file.write','command','mcp.call')) > 0,
+                    (SELECT COUNT(*) FROM command_events
+                      WHERE session_id IN (SELECT id FROM receipt_sessions)) > 0,
+                    (SELECT COUNT(*) FROM file_events
+                      WHERE session_id IN (SELECT id FROM receipt_sessions)) > 0,
+                    (SELECT COUNT(*) FROM mcp_events
+                      WHERE session_id IN (SELECT id FROM receipt_sessions)) > 0",
             params![session_id],
             |row| {
                 Ok(Coverage {
@@ -261,11 +283,18 @@ impl Store {
     /// Returns an error if the database cannot be queried.
     pub fn projects_for_session(&self, session_id: &str) -> Result<Vec<String>, StoreError> {
         let mut statement = self.connection().prepare(
-            "SELECT COALESCE(r.root, p.path)
+            "WITH RECURSIVE receipt_sessions(id) AS (
+                 SELECT ?1
+                 UNION
+                 SELECT s.id
+                   FROM sessions s
+                   JOIN receipt_sessions parent ON s.parent_session_id = parent.id
+             )
+             SELECT COALESCE(r.root, p.path)
                FROM session_projects sp
                JOIN projects p ON p.id = sp.project_id
                LEFT JOIN repositories r ON r.id = p.repository_id
-              WHERE sp.session_id = ?1
+              WHERE sp.session_id IN (SELECT id FROM receipt_sessions)
               ORDER BY sp.event_count DESC, sp.last_seen_us DESC",
         )?;
         let rows = statement.query_map([session_id], |row| row.get(0))?;
@@ -308,7 +337,23 @@ impl Store {
         }
         if let Some(session) = &filter.session {
             bindings.push(Box::new(session.clone()));
-            sql.push_str(&format!(" AND e.session_id = ?{}", bindings.len()));
+            let session_binding = bindings.len();
+            if filter.include_subagents {
+                sql.push_str(&format!(
+                    " AND e.session_id IN (
+                        WITH RECURSIVE receipt_sessions(id) AS (
+                            SELECT ?{session_binding}
+                            UNION
+                            SELECT s.id
+                              FROM sessions s
+                              JOIN receipt_sessions parent
+                                ON s.parent_session_id = parent.id
+                        )
+                        SELECT id FROM receipt_sessions)"
+                ));
+            } else {
+                sql.push_str(&format!(" AND e.session_id = ?{session_binding}"));
+            }
         }
         if let Some(prefix) = &filter.project_prefix {
             let prefix = if prefix == "/" {
@@ -439,6 +484,21 @@ mod tests {
         assert_eq!(sessions[0].files, 1);
         assert_eq!(sessions[0].status, "ended");
         assert_eq!(sessions[0].duration_ms, Some(3_000));
+    }
+
+    #[test]
+    fn a_session_started_before_the_range_is_included_when_it_has_activity_inside_it() {
+        let sessions = seeded()
+            .sessions(2_000_000, 3_000_000, 10)
+            .expect("sessions");
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].commands, 1);
+
+        let after_every_event = seeded()
+            .sessions(5_000_000, 6_000_000, 10)
+            .expect("sessions");
+        assert!(after_every_event.is_empty());
     }
 
     #[test]

@@ -200,7 +200,8 @@ Four counters are tracked separately — input, output, cache creation, and cach
 ```sh
 agentwatch sessions --days 7 --coverage             # counts, surface, and what was observed
 agentwatch sessions --agent claude,codex            # one unified session view
-agentwatch session latest                           # model, projects, counts, coverage
+agentwatch session latest                           # complete receipt for the newest main-agent session
+agentwatch session <id-prefix>                      # receipt for one exact Claude or Codex session
 agentwatch compare --by agent --days 30             # compare agent token usage
 agentwatch activity --days 1 --kind command,file.write
 agentwatch activity --days 7 --project ~/code/myrepo
@@ -211,6 +212,10 @@ agentwatch status
 
 `--coverage` is worth knowing about: it reports, per session, what the data *can* answer. `disabled` and `not collected` are distinct from `no` — one means the data was never gathered, the other that it was gathered and there was none.
 
+A session receipt includes its branch, duration, surface, projects, token usage split by model and main/subagent role, files touched, commands, sensitive access, a chronological event timeline, and explicit coverage gaps. Stored command lines are sanitized before they reach the receipt; sensitive entries classify path names without reading file contents.
+
+The receipt is built from AgentWatch's normalized events, so Claude Code and Codex use the same queries and rendering. Claude sidechain usage stays in its parent session; separate Codex subagent rollouts are linked recursively and rolled into the parent receipt. Adapter-specific blind spots remain explicit—for example, Codex rollouts expose patch writes but not direct file-read events, and do not identify every generic tool call as MCP.
+
 Event kinds for `--kind`: `session.started`, `session.ended`, `prompt`, `file.read`, `file.write`, `command`, `mcp.call`, `tool.call`, `token.usage`, `collection.paused`, `collection.resumed`, `config.changed`, `unknown`.
 
 ### Live view
@@ -219,7 +224,9 @@ Event kinds for `--kind`: `session.started`, `session.ended`, `prompt`, `file.re
 agentwatch watch                                    # full-screen, ~500ms refresh
 ```
 
-`watch` is a separate surface on purpose. It owns the terminal, so it cannot be piped; every other command prints plain stdout so it can be. The screen refreshes every ~500ms, but Codex data advances when its rollout reconciliation runs rather than on every redraw.
+`watch` is a separate surface on purpose. It owns the terminal, so it cannot be piped; every other command prints plain stdout so it can be. Its activity clock uses local time (and labels the UTC fallback), while exportable CLI timelines keep their `utc` label. The screen refreshes every ~500ms, but Codex data advances when its rollout reconciliation runs rather than on every redraw.
+
+The live view stays compact. Press `q`, then run `agentwatch session latest` for the full receipt with commands, files, sensitive access, model/subagent tokens, and timeline.
 
 ### Colour
 

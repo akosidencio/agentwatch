@@ -1,6 +1,8 @@
 //! Turning rows into lines.
 
-use agentwatch_storage::{EventRow, Notable, SessionRow, TokenTotals};
+use agentwatch_storage::{
+    EventRow, Notable, ReceiptCommand, ReceiptFile, ReceiptTokenGroup, SessionRow, TokenTotals,
+};
 use agentwatch_types::Timestamp;
 pub(crate) use agentwatch_types::thousands;
 
@@ -111,7 +113,7 @@ pub(crate) fn session_line(row: &SessionRow) -> String {
 }
 
 /// Renders a duration in milliseconds as a short human string.
-fn format_duration(milliseconds: i64) -> String {
+pub(crate) fn format_duration(milliseconds: i64) -> String {
     let seconds = milliseconds / 1_000;
     if seconds < 60 {
         return format!("{seconds}s");
@@ -123,11 +125,89 @@ fn format_duration(milliseconds: i64) -> String {
     format!("{}h {}m", minutes / 60, minutes % 60)
 }
 
+/// Column header for the files section of a session receipt.
+pub(crate) fn receipt_file_header() -> String {
+    theme::paint(
+        &format!(
+            "{:>5}  {:>5}  {:<8}  {:<20}  {}",
+            "read", "write", "last utc", "tools", "path"
+        ),
+        theme::MUTED,
+    )
+}
+
+/// One aggregated file row in a session receipt.
+pub(crate) fn receipt_file_line(row: &ReceiptFile) -> String {
+    let home = std::env::var("HOME").ok();
+    let path = scoped_path(&row.path, row.project.as_deref(), home.as_deref());
+    format!(
+        "{:>5}  {:>5}  {:<8}  {:<20}  {}",
+        row.reads,
+        row.writes,
+        clock_time(row.last_seen_us),
+        row.tools,
+        path
+    )
+}
+
+/// Column header for the commands section of a session receipt.
+pub(crate) fn receipt_command_header() -> String {
+    theme::paint(
+        &format!("{:<8}  {:<17}  {}", "utc", "sensitivity", "command"),
+        theme::MUTED,
+    )
+}
+
+/// One command row in a session receipt.
+pub(crate) fn receipt_command_line(row: &ReceiptCommand) -> String {
+    let command = row.command.replace(['\r', '\n'], " ");
+    let detail = row
+        .description
+        .as_deref()
+        .filter(|description| !description.is_empty())
+        .map_or_else(String::new, |description| format!(" — {description}"));
+    let home = std::env::var("HOME").ok();
+    let project = row.project.as_deref().map_or_else(String::new, |project| {
+        format!("  [{}]", short_path(project, home.as_deref()))
+    });
+    format!(
+        "{:<8}  {:<17}  {command}{detail}{project}",
+        clock_time(row.timestamp_us),
+        row.sensitivity
+    )
+}
+
+/// Column header for the detailed token section of a session receipt.
+pub(crate) fn receipt_token_header() -> String {
+    theme::paint(
+        &format!(
+            "{:<9}  {:<24}  {:>12}  {:>12}  {:>12}  {:>12}  {:>12}  {:>9}",
+            "role", "model", "input", "cache new", "cache read", "output", "total", "responses"
+        ),
+        theme::MUTED,
+    )
+}
+
+/// One model/role token row in a session receipt.
+pub(crate) fn receipt_token_line(row: &ReceiptTokenGroup) -> String {
+    format!(
+        "{:<9}  {:<24}  {:>12}  {:>12}  {:>12}  {:>12}  {:>12}  {:>9}",
+        if row.is_subagent { "subagent" } else { "main" },
+        row.model,
+        thousands(row.totals.input),
+        thousands(row.totals.cache_creation),
+        thousands(row.totals.cache_read),
+        thousands(row.totals.output),
+        thousands(row.totals.total()),
+        thousands(row.totals.responses),
+    )
+}
+
 /// Column header for a sensitive-access listing.
 pub(crate) fn notable_header() -> String {
     theme::paint(
         &format!(
-            "{:<17}  {:<8}  {:<9}  {:<8}  {}",
+            "{:<17}  {:<8}  {:<9}  {:<10}  {}",
             "severity", "utc", "kind", "evidence", "path"
         ),
         theme::MUTED,
@@ -137,11 +217,12 @@ pub(crate) fn notable_header() -> String {
 /// One row of a sensitive-access listing.
 pub(crate) fn notable_line(row: &Notable) -> String {
     let home = std::env::var("HOME").ok();
+    let path = scoped_path(&row.path, row.project.as_deref(), home.as_deref());
     // Severity is the column people scan, so it is the column that carries the
     // colour. Unknown severities stay unpainted rather than being guessed at.
     let severity_colour = match row.sensitivity.to_string().as_str() {
-        "critical" | "high" => theme::BAD,
-        "medium" => theme::WARN,
+        "critical" | "high" | "highly_sensitive" => theme::BAD,
+        "medium" | "sensitive" => theme::WARN,
         _ => theme::MUTED,
     };
     format!(
@@ -152,9 +233,46 @@ pub(crate) fn notable_line(row: &Notable) -> String {
             theme::MUTED
         ),
         row.kind,
-        theme::paint(&format!("{:<8}", row.evidence), theme::MUTED),
-        short_path(&row.path, home.as_deref())
+        theme::paint(&format!("{:<10}", row.evidence), theme::MUTED),
+        path
     )
+}
+
+/// Honest limitations for one adapter's session receipt.
+///
+/// Unknown adapters receive only product-wide limitations. This makes a new
+/// adapter useful immediately without attributing Codex- or Claude-specific
+/// blind spots to it.
+pub(crate) fn coverage_gaps(agent_id: &str, branch_known: bool) -> Vec<String> {
+    let mut gaps = Vec::new();
+    if !branch_known {
+        gaps.push("git branch     not reported by the source log".to_owned());
+    }
+    if agent_id == "codex" {
+        gaps.push(
+            "Codex files    rollout logs expose patch writes, but not direct file-read events"
+                .to_owned(),
+        );
+        gaps.push(
+            "Codex MCP      rollout calls are generic tools unless Codex identifies MCP metadata"
+                .to_owned(),
+        );
+    }
+    gaps.push("network        not collected".to_owned());
+    gaps.push("processes      not collected".to_owned());
+    gaps.push("prompt content disabled by design".to_owned());
+    gaps
+}
+
+/// Shows a relative path together with the project that gives it meaning.
+fn scoped_path(path: &str, project: Option<&str>, home: Option<&str>) -> String {
+    let path = short_path(path, home);
+    if std::path::Path::new(&path).is_absolute() || path.starts_with("~/") {
+        return path;
+    }
+    project.map_or(path.clone(), |project| {
+        format!("{path}  [{}]", short_path(project, home))
+    })
 }
 
 /// The column header for a token breakdown.
@@ -294,7 +412,7 @@ pub(crate) fn event_segments(row: &EventRow) -> EventSegments {
 }
 
 /// Renders a timestamp as local wall-clock time.
-fn clock_time(micros: i64) -> String {
+pub(crate) fn clock_time(micros: i64) -> String {
     Timestamp::from_micros(micros)
         .to_rfc3339()
         .split('T')
@@ -400,6 +518,76 @@ mod tests {
             project_path: Some("/work/acme".to_owned()),
             payload: payload.to_owned(),
         }
+    }
+
+    #[test]
+    fn receipt_token_rows_keep_models_roles_and_all_counters_visible() {
+        let row = ReceiptTokenGroup {
+            model: "gpt-5.6-codex".to_owned(),
+            is_subagent: true,
+            totals: TokenTotals {
+                input: 10,
+                cache_creation: 20,
+                cache_read: 30,
+                output: 40,
+                responses: 2,
+            },
+        };
+        let line = receipt_token_line(&row);
+
+        assert!(line.contains("subagent"), "{line}");
+        assert!(line.contains("gpt-5.6-codex"), "{line}");
+        for count in ["10", "20", "30", "40", "100", "2"] {
+            assert!(line.contains(count), "missing {count} in {line}");
+        }
+    }
+
+    #[test]
+    fn receipt_commands_cannot_break_the_table_with_embedded_newlines() {
+        let row = ReceiptCommand {
+            timestamp_us: 1_755_000_000_000_000,
+            command: "printf first\nprintf second".to_owned(),
+            description: Some("two writes".to_owned()),
+            sensitivity: "normal".to_owned(),
+            project: Some("/work/acme".to_owned()),
+        };
+        let line = receipt_command_line(&row);
+
+        assert!(!line.contains('\n'), "{line:?}");
+        assert!(line.contains("printf first printf second"), "{line}");
+        assert!(line.contains("two writes"), "{line}");
+        assert!(line.contains("[/work/acme]"), "{line}");
+    }
+
+    #[test]
+    fn relative_sensitive_paths_are_scoped_to_their_project() {
+        let row = Notable {
+            timestamp_us: 1_755_000_000_000_000,
+            sensitivity: "sensitive".to_owned(),
+            kind: "command".to_owned(),
+            path: ".env".to_owned(),
+            evidence: "derived".to_owned(),
+            project: Some("/work/acme".to_owned()),
+        };
+
+        let line = notable_line(&row);
+        assert!(line.contains(".env  [/work/acme]"), "{line}");
+    }
+
+    #[test]
+    fn coverage_gaps_are_adapter_specific_but_safe_for_future_adapters() {
+        let claude = coverage_gaps("claude-code", true);
+        assert!(!claude.iter().any(|gap| gap.contains("Codex")));
+        assert!(!claude.iter().any(|gap| gap.contains("git branch")));
+
+        let codex = coverage_gaps("codex", false);
+        assert!(codex.iter().any(|gap| gap.contains("file-read")));
+        assert!(codex.iter().any(|gap| gap.contains("MCP")));
+        assert!(codex.iter().any(|gap| gap.contains("git branch")));
+
+        let future = coverage_gaps("future-agent", true);
+        assert!(!future.iter().any(|gap| gap.contains("Codex")));
+        assert!(future.iter().any(|gap| gap.contains("network")));
     }
 
     #[test]

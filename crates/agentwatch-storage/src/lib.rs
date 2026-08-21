@@ -9,6 +9,7 @@
 mod config_watch;
 mod migrations;
 mod query;
+mod receipt;
 mod repositories;
 mod security;
 mod sessions;
@@ -17,6 +18,7 @@ mod tokens;
 
 pub use config_watch::ConfigCheck;
 pub use query::{EventRow, Totals};
+pub use receipt::{ReceiptCommand, ReceiptFile, ReceiptTokenGroup};
 pub use repositories::BackfillReport;
 pub use security::Notable;
 pub use sessions::{ActivityFilter, Coverage, SessionFilter, SessionRow};

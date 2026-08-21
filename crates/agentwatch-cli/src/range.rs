@@ -11,6 +11,10 @@ use time::{Date, Duration, OffsetDateTime, UtcOffset};
 const DATE_FORMAT: &[time::format_description::FormatItem<'_>] =
     time::macros::format_description!("[year]-[month]-[day]");
 
+/// Compact wall-clock format used by the live dashboard.
+const CLOCK_FORMAT: &[time::format_description::FormatItem<'_>] =
+    time::macros::format_description!("[hour]:[minute]:[second]");
+
 /// A half-open range of microseconds since the Unix epoch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Range {
@@ -51,7 +55,7 @@ pub(crate) struct Zone {
 
 impl Zone {
     /// A fixed-offset zone, primarily useful for deterministic tests.
-    const fn fixed(offset: UtcOffset) -> Self {
+    pub(crate) const fn fixed(offset: UtcOffset) -> Self {
         Self {
             fallback: offset,
             local: false,
@@ -80,6 +84,20 @@ impl Zone {
     fn today(self) -> Date {
         let now = OffsetDateTime::now_utc();
         now.to_offset(self.offset_at(now)).date()
+    }
+
+    /// Formats one UTC timestamp as a wall-clock time in this zone.
+    pub(crate) fn clock_time(self, timestamp_us: i64) -> String {
+        let nanos = i128::from(timestamp_us) * 1_000;
+        OffsetDateTime::from_unix_timestamp_nanos(nanos).map_or_else(
+            |_| timestamp_us.to_string(),
+            |instant| {
+                instant
+                    .to_offset(self.offset_at(instant))
+                    .format(CLOCK_FORMAT)
+                    .unwrap_or_else(|_| timestamp_us.to_string())
+            },
+        )
     }
 }
 
@@ -249,5 +267,19 @@ mod tests {
 
         assert_eq!(midnight.offset(), winter);
         assert_eq!(midnight.hour(), 0);
+    }
+
+    #[test]
+    fn dashboard_clock_converts_utc_to_manila_time() {
+        let instant = OffsetDateTime::parse(
+            "2026-08-21T17:03:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("timestamp");
+
+        assert_eq!(
+            Zone::fixed(manila()).clock_time(micros(instant)),
+            "01:03:00"
+        );
     }
 }
