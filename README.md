@@ -198,7 +198,9 @@ agentwatch tokens --from 2026-08-01 --to 2026-08-21 --by model
 
 Four counters are tracked separately — input, output, cache creation, and cache read — because providers bill them very differently and merging them at ingestion would make cost estimation permanently unfixable.
 
-`--detail` reads counters the provider sent that the four headline figures do not cover, and it needs no new collection: they were already being preserved verbatim at ingestion, so existing history answers immediately. Reasoning tokens are normalised across providers — Anthropic calls them `output_tokens_details.thinking_tokens`, OpenAI calls them `reasoning_output_tokens`, and unlike the headline counters they *are* comparable, being a subset of output either way. Cache writes are split by TTL, because the five-minute and one-hour tiers are priced differently and a blended total cannot be un-blended later.
+`--detail` reads counters the provider sent that the four headline figures do not cover: they were already being preserved verbatim at ingestion, so existing history answers immediately. Reasoning tokens are normalised across providers — Anthropic calls them `output_tokens_details.thinking_tokens`, OpenAI calls them `reasoning_output_tokens`, and unlike the headline counters they *are* comparable, being a subset of output either way. Cache writes are split by TTL, because the five-minute and one-hour tiers are priced differently and a blended total cannot be un-blended later. Cache *misses* are counted too, with the cause the provider gave — a miss means paying full input price on a prompt that was expected to be nearly free, and nothing else explains a cost spike as directly.
+
+Re-reading a transcript refreshes this remainder on rows that already exist, which is how a reader that learns to extract something new can apply it to history rather than only to what arrives next. The four counters are never rewritten: a total that cannot move is the point of the idempotency guarantee, and refreshing a JSON blob beside them moves none.
 
 **Providers are reported apart, for the same reason.** The counters are comparable within a provider and not across one: Anthropic serves nearly all of its input from the prompt cache and reports it as cache reads, while OpenAI reports no cache *writes* at all. Summed, the cache-write line silently describes one provider and the input line adds two quantities that different tokenizers measured differently. So the headline is one block per provider, and the combined footer totals what actually survives addition — the response count — with the token sum shown but labelled as a cross-tokenizer figure. With only one provider in range there is nothing to combine and the footer is omitted. `--by model` qualifies each model with the provider that served it, so `anthropic/claude-opus-5` and `openai/gpt-5.6-sol` are never two rows of an apparently uniform ranking.
 
@@ -210,6 +212,10 @@ agentwatch sessions --agent claude,codex            # one unified session view
 agentwatch session latest                           # complete receipt for the newest main-agent session
 agentwatch session <id-prefix>                      # receipt for one exact Claude or Codex session
 agentwatch compare --by agent --days 30             # compare agent token usage
+agentwatch reliability --all                        # failure rate and latency per tool
+agentwatch churn --all                              # files the agents kept rewriting
+agentwatch sql "SELECT ..."                         # anything the commands do not cover
+agentwatch activity --kind permission.mode,queue    # posture changes and queued work
 agentwatch activity --days 1 --kind command,file.write
 agentwatch activity --days 7 --project ~/code/myrepo
 agentwatch security --days 7                        # access to sensitive paths
@@ -218,6 +224,16 @@ agentwatch status
 ```
 
 `--coverage` is worth knowing about: it reports, per session, what the data *can* answer. `disabled` and `not collected` are distinct from `no` — one means the data was never gathered, the other that it was gathered and there was none.
+
+`agentwatch sql` is the escape hatch. Every other command answers a question someone already thought of, and the database holds more than those questions — an unrecognised provider counter, a record type this version does not model, a correlation nobody has written a report for yet. The connection is opened `query_only`, so a write is refused by SQLite itself rather than by inspecting your statement: parsing SQL to decide whether it looks dangerous is a game lost by default. Pass `--json` for one object per row, or pipe the query in on stdin.
+
+`agentwatch churn` lists the files the agents kept coming back to. A high write count is not a sign the file matters — it is the signature of work that went in circles, and it is invisible in any per-session summary because each individual write looks ordinary. Reads are shown beside writes because the ratio separates two different shapes: a file re-read before each edit is being worked carefully, one written repeatedly without being read is being guessed at.
+
+**Permission posture is recorded as it changes.** Every file write and command in the timeline was made under some posture, and they do not read the same: a write made while you approved each edit is a different event from the same write made unattended under `acceptEdits`. Only transitions are stored, since the posture holds until something changes it.
+
+**Queue movements measure the wait you actually felt.** A message queued while the agent was busy, and the gap until it ran, is the one cost of a session that no token count reflects. Only that the queue moved is recorded, never the message.
+
+`agentwatch reliability` answers how often each tool fails and how long it takes, recovered by pairing each `tool_use` block with the `tool_result` that answers it. Only the result's `tool_use_id` and `is_error` flag are read — the output beside them is named nowhere, so it cannot reach a value. Durations are wall-clock between the two records, which means a call that sat awaiting your approval, or a session left open and resumed, shows an enormous `max` for a command that took a second; on the development corpus that is about one call in two hundred, so read `p50` and `p95` and treat `max` as an outlier hunt. A call with no recorded duration still counts towards the failure rate but is left out of the percentiles rather than averaged in as zero.
 
 A session receipt includes its branch, duration, surface, projects, token usage split by model and main/subagent role, files touched, commands, sensitive access, a chronological event timeline, and explicit coverage gaps. Stored command lines are sanitized before they reach the receipt; sensitive entries classify path names without reading file contents.
 

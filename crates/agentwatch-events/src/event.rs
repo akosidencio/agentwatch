@@ -177,6 +177,24 @@ pub enum Event {
     /// Some other agent tool ran.
     #[serde(rename = "tool.call")]
     ToolCall(ToolCallEvent),
+    /// How a tool call turned out.
+    #[serde(rename = "tool.outcome")]
+    ToolOutcome(ToolOutcomeEvent),
+    /// The agent stopped to wait for the human.
+    #[serde(rename = "notification")]
+    Notification(NotificationEvent),
+    /// A turn finished.
+    #[serde(rename = "turn.ended")]
+    TurnEnded(TurnEndedEvent),
+    /// The conversation was compacted to fit the context window.
+    #[serde(rename = "context.compacted")]
+    ContextCompacted(ContextCompactedEvent),
+    /// The user queued, ran, or dropped a message while the agent was busy.
+    #[serde(rename = "queue")]
+    Queue(QueueEvent),
+    /// The permission posture the agent was operating under changed.
+    #[serde(rename = "permission.mode")]
+    PermissionMode(PermissionModeEvent),
     /// A model response's token usage.
     #[serde(rename = "token.usage")]
     TokenUsage(TokenUsageEvent),
@@ -211,6 +229,12 @@ impl Event {
             Self::Command(_) => "command",
             Self::McpCall(_) => "mcp.call",
             Self::ToolCall(_) => "tool.call",
+            Self::ToolOutcome(_) => "tool.outcome",
+            Self::PermissionMode(_) => "permission.mode",
+            Self::Notification(_) => "notification",
+            Self::Queue(_) => "queue",
+            Self::TurnEnded(_) => "turn.ended",
+            Self::ContextCompacted(_) => "context.compacted",
             Self::TokenUsage(_) => "token.usage",
             Self::Collection(collection) => {
                 if collection.paused {
@@ -290,6 +314,129 @@ pub struct McpEvent {
 pub struct ToolCallEvent {
     /// The tool name as the agent reported it.
     pub tool: String,
+}
+
+/// How a tool call turned out.
+///
+/// # Why this is its own event and not a field on the call
+///
+/// It arrives as its own record. The agent writes the call when it makes it and
+/// the result only once the tool has returned, which for a long build is
+/// minutes later and many records apart. Modelling the result as an attribute
+/// of the call would mean either holding every call open until its answer
+/// showed up, or rewriting an event already written — and events here are
+/// append-only.
+///
+/// It carries the tool name as well as the identifier so a reliability report
+/// needs no join: grouping this one kind answers "how often does this tool
+/// fail, and how long does it take".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolOutcomeEvent {
+    /// The tool that ran.
+    pub tool: String,
+    /// The agent's identifier for the call this answers.
+    ///
+    /// The same string the call itself was keyed on, so the two can be paired
+    /// when something needs them together.
+    pub tool_use_id: String,
+    /// Wall-clock milliseconds between the call and its result.
+    ///
+    /// Absent when either record carried no usable timestamp; a missing
+    /// duration is not a zero one, and a report must not average it as such.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Whether the agent reported the call as failed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub failed: bool,
+}
+
+/// Something happened to the queue of messages waiting to be sent.
+///
+/// # What this is actually measuring
+///
+/// A message is queued because the user had more to say while the agent was
+/// still working. The gap between an `enqueue` and its `dequeue` is therefore
+/// time the *person* spent waiting on the agent — the one cost of an agent
+/// session that no token count reflects. A `remove` is a message the user
+/// thought better of, which is its own signal about work that went astray.
+///
+/// No message content is carried, only that the queue moved.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueEvent {
+    /// What happened: `enqueue`, `dequeue`, `remove`.
+    ///
+    /// Stored verbatim rather than as an enum, like every other vocabulary the
+    /// agent owns: an operation this version has not seen should appear as
+    /// itself.
+    pub operation: String,
+}
+
+/// The agent paused and asked the human for something.
+///
+/// # Why this one cannot be recovered later
+///
+/// Everything else here can be reconstructed from the transcript after the
+/// fact. This cannot: the transcript records what was eventually done, not that
+/// the agent sat waiting to be allowed to do it. Time blocked on a person is
+/// invisible in every other source, and it is the difference between a session
+/// that took an hour and a session that worked for an hour.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationEvent {
+    /// What the agent said it was waiting for.
+    ///
+    /// The agent's own wording, e.g. asking permission to run a tool. Not user
+    /// text and not model output, so it is kept as-is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// A turn came to an end.
+///
+/// Turn boundaries were previously inferred from the gaps between token usage
+/// records, which is a guess. This is the agent saying so.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnEndedEvent {
+    /// Whether this was a spawned subagent finishing rather than the main thread.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub subagent: bool,
+}
+
+/// The conversation was compacted to fit the context window.
+///
+/// Worth recording for two reasons: it explains a sudden drop in cached input
+/// tokens, and it explains a transcript that appears to lose history — which is
+/// the benign cause of `verify` reporting storage as ahead of the source.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCompactedEvent {
+    /// Whether the agent compacted on its own or was asked to: `auto`, `manual`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
+}
+
+/// The permission posture the agent was operating under.
+///
+/// # Why this is worth a row of its own
+///
+/// Every file write and every command already in the timeline was performed
+/// under some posture, and they do not read the same. A write made while the
+/// user was approving each edit is a different event from the same write made
+/// unattended under `acceptEdits`, and until now the record could not tell them
+/// apart. Only changes are recorded — the posture holds until something says
+/// otherwise, so writing a row per turn would be noise.
+///
+/// The value is stored verbatim rather than mapped onto an enum, for the same
+/// reason the session surface is: a posture this version has never heard of
+/// should appear as itself, not collapse into `Other`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionModeEvent {
+    /// What the agent called it: `default`, `acceptEdits`, `plan`, `auto`.
+    pub mode: String,
+    /// The posture this replaced, when there was one.
+    ///
+    /// Absent on the first sighting in a session, which is a starting state
+    /// rather than a change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
 }
 
 /// Token usage for one model response.

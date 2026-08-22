@@ -262,6 +262,42 @@ enum Command {
         #[arg(long, value_delimiter = ',')]
         kind: Vec<String>,
     },
+    /// List the files the agents rewrote most.
+    Churn {
+        /// Number of calendar days to include, ending today.
+        #[arg(long, default_value_t = 30)]
+        days: u32,
+        /// Ignore dates and count everything ever recorded.
+        #[arg(long)]
+        all: bool,
+        /// Show at most this many files.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Run a read-only SQL query against the collected data.
+    ///
+    /// The connection is opened `query_only`, so a write is refused by SQLite
+    /// itself. Tables: events, sessions, projects, repositories, token_usage,
+    /// file_events, command_events, mcp_events, tool_outcomes.
+    Sql {
+        /// The query. Reads from stdin when omitted.
+        query: Option<String>,
+        /// Emit one JSON object per row instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Report how often each tool fails, and how long it takes.
+    Reliability {
+        /// Number of calendar days to include, ending today.
+        #[arg(long, default_value_t = 30)]
+        days: u32,
+        /// Ignore dates and count everything ever recorded.
+        #[arg(long)]
+        all: bool,
+        /// Show at most this many tools.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// List access to sensitive paths.
     Security {
         /// Number of calendar days to include, ending today.
@@ -448,6 +484,9 @@ fn main() -> Result<()> {
                 kinds: kind,
             },
         ),
+        Command::Churn { days, all, limit } => churn(&paths, days, all, limit),
+        Command::Sql { query, json } => sql(&paths, query.as_deref(), json),
+        Command::Reliability { days, all, limit } => reliability(&paths, days, all, limit),
         Command::Security { days, limit } => security(&paths, days, limit),
         Command::Export { days, limit, kind } => export(&paths, days, limit, kind),
         Command::Import { limit } => import(&paths, limit),
@@ -699,6 +738,222 @@ fn tokens(
     Ok(())
 }
 
+/// Prints the files that were rewritten most.
+fn churn(paths: &Paths, days: u32, all: bool, limit: usize) -> Result<()> {
+    let store = open_for_reading(paths)?;
+    let (zone, _) = range::local_zone();
+    let range = if all {
+        range::all_time(zone)
+    } else {
+        range::last_days(days, zone)
+    };
+
+    let churn = store
+        .file_churn(range.from_us, range.to_us, limit)
+        .context("reading file churn")?;
+
+    println!("{}", theme::bold(&format!("File churn — {}", range.label)));
+    println!();
+
+    if churn.is_empty() {
+        println!("No file writes in range.");
+        return Ok(());
+    }
+
+    println!(
+        "{}",
+        theme::paint(
+            &format!("{:>7}{:>8}{:>10}  {}", "writes", "reads", "sessions", "file"),
+            theme::MUTED
+        )
+    );
+
+    for file in &churn {
+        println!(
+            "{:>7}{:>8}{:>10}  {}",
+            file.writes,
+            file.reads,
+            file.sessions,
+            render::short_path(&file.path, std::env::var("HOME").ok().as_deref()),
+        );
+    }
+
+    Ok(())
+}
+
+/// Runs a read-only query and prints the result.
+fn sql(paths: &Paths, query: Option<&str>, as_json: bool) -> Result<()> {
+    let query = match query {
+        Some(query) => query.to_owned(),
+        None => {
+            use std::io::Read as _;
+            let mut buffer = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buffer)
+                .context("reading the query from stdin")?;
+            buffer
+        }
+    };
+    anyhow::ensure!(!query.trim().is_empty(), "no query given");
+
+    let store = open_for_reading(paths)?;
+    let result = store.query(&query).context("running the query")?;
+
+    if as_json {
+        for row in &result.rows {
+            let object: serde_json::Map<String, serde_json::Value> = result
+                .columns
+                .iter()
+                .zip(row)
+                .map(|(column, value)| {
+                    let value = value.as_ref().map_or(serde_json::Value::Null, |text| {
+                        serde_json::Value::String(text.clone())
+                    });
+                    (column.clone(), value)
+                })
+                .collect();
+            println!("{}", serde_json::Value::Object(object));
+        }
+        return Ok(());
+    }
+
+    if result.rows.is_empty() {
+        println!("No rows.");
+        return Ok(());
+    }
+
+    // Column widths come from the data, so a narrow result does not print a
+    // table padded out to nothing. NULL is shown as a dash rather than an
+    // empty cell, which is indistinguishable from an empty string.
+    let cell = |value: &Option<String>| value.clone().unwrap_or_else(|| "—".to_owned());
+    let mut widths: Vec<usize> = result.columns.iter().map(|c| c.chars().count()).collect();
+    for row in &result.rows {
+        for (index, value) in row.iter().enumerate() {
+            widths[index] = widths[index].max(cell(value).chars().count());
+        }
+    }
+
+    let line = |cells: Vec<String>| {
+        cells
+            .iter()
+            .zip(&widths)
+            .map(|(text, width)| format!("{text:<width$}"))
+            .collect::<Vec<_>>()
+            .join("  ")
+            .trim_end()
+            .to_owned()
+    };
+
+    // Padded before painting: escape bytes count as width otherwise.
+    println!("{}", theme::paint(&line(result.columns.clone()), theme::MUTED));
+    for row in &result.rows {
+        println!("{}", line(row.iter().map(cell).collect()));
+    }
+    println!();
+    println!(
+        "{}",
+        theme::paint(&format!("{} rows", result.rows.len()), theme::MUTED)
+    );
+
+    Ok(())
+}
+
+/// Prints how each tool has behaved: how often it fails and how long it takes.
+fn reliability(paths: &Paths, days: u32, all: bool, limit: usize) -> Result<()> {
+    let store = open_for_reading(paths)?;
+    let (zone, _) = range::local_zone();
+    let range = if all {
+        range::all_time(zone)
+    } else {
+        range::last_days(days, zone)
+    };
+
+    let report = store
+        .tool_reliability(range.from_us, range.to_us)
+        .context("reading tool reliability")?;
+
+    println!(
+        "{}",
+        theme::bold(&format!("Tool reliability — {}", range.label))
+    );
+    println!();
+
+    if report.is_empty() {
+        println!(
+            "No completed tool calls in range. Outcomes are read from transcripts, so run \
+             `agentwatch import` if this is a fresh database."
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{}",
+        theme::paint(
+            &format!(
+                "{:<16}{:>8}{:>9}{:>10}{:>10}{:>10}",
+                "tool", "calls", "failed", "p50", "p95", "max"
+            ),
+            theme::MUTED
+        )
+    );
+
+    for tool in report.iter().take(limit) {
+        let rate = tool.failure_rate();
+        // A failure rate is the one column worth colouring: it is the only one
+        // where a number is a problem rather than just a fact. Zero stays
+        // unpainted so a healthy table is quiet.
+        let failed = if tool.failures == 0 {
+            format!("{:>8}", "—")
+        } else {
+            let text = format!("{:>7.1}%", rate);
+            let colour = if rate >= 10.0 { theme::BAD } else { theme::WARN };
+            // Padded before painting: escape bytes count as width otherwise.
+            format!("{}{}", " ", theme::paint(&text, colour))
+        };
+
+        println!(
+            "{:<16}{:>8}{}{:>10}{:>10}{:>10}",
+            tool.tool,
+            render::thousands(tool.calls),
+            failed,
+            duration(tool.p50_ms),
+            duration(tool.p95_ms),
+            duration(tool.max_ms),
+        );
+    }
+
+    if report.len() > limit {
+        println!("... and {} more (--limit {})", report.len() - limit, report.len());
+    }
+
+    // Said once, under the table, because the `max` column invites exactly the
+    // wrong conclusion otherwise: durations are wall-clock between the call and
+    // its result, so a tool that sat waiting for your approval reads as slow.
+    println!();
+    println!(
+        "{}",
+        theme::paint(
+            "Durations are wall-clock, so a call awaiting approval or a resumed session \
+             inflates max. Read p50 and p95.",
+            theme::MUTED
+        )
+    );
+
+    Ok(())
+}
+
+/// Renders a millisecond duration, or a dash when it was never measured.
+///
+/// A missing duration is not a zero one, so it must not print as `0ms`.
+fn duration(ms: Option<i64>) -> String {
+    match ms {
+        None => "—".to_owned(),
+        Some(ms) if ms < 1_000 => format!("{ms}ms"),
+        Some(ms) if ms < 60_000 => format!("{:.1}s", ms as f64 / 1_000.0),
+        Some(ms) => format!("{}m{:02}s", ms / 60_000, (ms % 60_000) / 1_000),
+    }
+}
+
 /// The column heading for a grouping.
 const fn by_label(by: Grouping) -> &'static str {
     match by {
@@ -746,7 +1001,7 @@ fn print_provider_totals(
         if let Some(only) = providers.first()
             && let Some(found) = detail_for(&only.label)
         {
-            print_detail(found);
+            print_detail(found, overall);
         }
         return;
     }
@@ -755,7 +1010,7 @@ fn print_provider_totals(
         println!("  {}", theme::bold(&provider.label));
         print_totals(&provider.totals);
         if let Some(found) = detail_for(&provider.label) {
-            print_detail(found);
+            print_detail(found, &provider.totals);
         }
         println!();
     }
@@ -787,7 +1042,7 @@ fn print_provider_totals(
 /// are shown against the figure they are a subset of — reasoning against
 /// output, each cache tier against total cache write — because the absolute
 /// number alone does not say whether it is worth acting on.
-fn print_detail(detail: &TokenDetail) {
+fn print_detail(detail: &TokenDetail, totals: &TokenTotals) {
     if detail.is_empty() {
         return;
     }
@@ -832,6 +1087,23 @@ fn print_detail(detail: &TokenDetail) {
     }
     if detail.web_fetch_requests > 0 {
         line("web fetch", detail.web_fetch_requests, "");
+    }
+
+    // Shown as a share of responses because the absolute count says nothing on
+    // its own: ten misses in ten thousand responses is noise, ten in fifty is
+    // the reason the bill moved.
+    if detail.cache_misses > 0 {
+        let note = totals.responses.gt(&0).then(|| {
+            format!(
+                "   {:.1}% of responses",
+                detail.cache_misses as f64 * 100.0 / totals.responses as f64
+            )
+        });
+        line(
+            "cache misses",
+            detail.cache_misses,
+            note.as_deref().unwrap_or(""),
+        );
     }
 }
 

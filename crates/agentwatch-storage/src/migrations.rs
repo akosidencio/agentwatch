@@ -321,6 +321,39 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         CREATE INDEX sessions_parent ON sessions (parent_session_id);
         ",
     },
+    Migration {
+        version: 11,
+        name: "tool_outcomes",
+        sql: r"
+        -- How a tool call turned out: how long it took and whether it failed.
+        --
+        -- `tool` is stored beside the identifier on purpose, so a reliability
+        -- report groups this table alone and never joins back to the call.
+        --
+        -- `duration_ms` is nullable and means 'not known', not 'instant'. A
+        -- result whose record carried no usable timestamp must not be averaged
+        -- in as a zero.
+        CREATE TABLE tool_outcomes (
+            id            TEXT PRIMARY KEY,
+            timestamp_us  INTEGER NOT NULL,
+            agent_id      TEXT NOT NULL,
+            session_id    TEXT,
+            project_id    TEXT,
+            repository_id TEXT,
+            tool          TEXT NOT NULL,
+            tool_use_id   TEXT NOT NULL,
+            duration_ms   INTEGER,
+            failed        INTEGER NOT NULL,
+            created_at_us INTEGER NOT NULL
+        ) STRICT;
+
+        CREATE INDEX tool_outcomes_timestamp  ON tool_outcomes (timestamp_us);
+        CREATE INDEX tool_outcomes_tool       ON tool_outcomes (tool, timestamp_us);
+        CREATE INDEX tool_outcomes_failed     ON tool_outcomes (failed, timestamp_us);
+        CREATE INDEX tool_outcomes_project    ON tool_outcomes (project_id, timestamp_us);
+        CREATE INDEX tool_outcomes_repository ON tool_outcomes (repository_id, timestamp_us);
+        ",
+    },
 ];
 
 /// The schema version this build expects.

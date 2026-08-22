@@ -19,7 +19,8 @@ pub use adapter::{AdapterError, HookAdapter};
 pub use command_scan::{PathReference, scan_command, worst_in_command};
 pub use event::{
     AgentEvent, CollectionEvent, CommandEvent, ConfigChangedEvent, Event, FileEvent, McpEvent,
-    PromptEvent, SessionEnded, SessionStarted, TokenUsageEvent, ToolCallEvent, UnknownEvent,
+    ContextCompactedEvent, NotificationEvent, PermissionModeEvent, PromptEvent, QueueEvent, SessionEnded, SessionStarted, TokenUsageEvent, ToolCallEvent, ToolOutcomeEvent, TurnEndedEvent,
+    UnknownEvent,
 };
 pub use evidence::{Confidence, EvidenceSource};
 pub use redact::{CommandRedactor, RedactionPatternError, redact_command};

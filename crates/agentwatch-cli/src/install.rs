@@ -15,11 +15,22 @@ use agentwatch_types::is_our_hook_command;
 use serde_json::{Map, Value, json};
 
 /// Hook events we register for.
-pub(crate) const HOOK_EVENTS: [&str; 4] = [
+pub(crate) const HOOK_EVENTS: [&str; 8] = [
     "SessionStart",
     "SessionEnd",
     "UserPromptSubmit",
     "PostToolUse",
+    // Waiting on the human. The one signal no transcript can reconstruct:
+    // the record shows what was eventually done, never that the agent sat
+    // waiting to be allowed to do it.
+    "Notification",
+    // Real turn boundaries, rather than boundaries inferred from the gaps
+    // between token usage records.
+    "Stop",
+    "SubagentStop",
+    // Compaction, which explains both a cliff in cached input and a
+    // transcript that appears to lose history.
+    "PreCompact",
 ];
 
 /// What a plan would change.
@@ -333,7 +344,18 @@ mod tests {
         let session_start = updated["hooks"]["SessionStart"].as_array().expect("array");
         assert_eq!(session_start.len(), 2, "ours should be a separate group");
         assert_eq!(session_start[0], original["hooks"]["SessionStart"][0]);
-        assert_eq!(updated["hooks"]["Stop"], original["hooks"]["Stop"]);
+
+        // We register for `Stop` too, so the foreign entry is no longer alone
+        // there — but it must still be untouched and still be first. Ours goes
+        // in its own group beside it, which is what makes an uninstall able to
+        // remove exactly what we added.
+        let stop = updated["hooks"]["Stop"].as_array().expect("array");
+        assert_eq!(stop.len(), 2);
+        assert_eq!(stop[0], original["hooks"]["Stop"][0]);
+        assert_eq!(
+            stop[1]["hooks"][0]["command"],
+            serde_json::json!("/bin/agentwatch hook")
+        );
     }
 
     #[test]

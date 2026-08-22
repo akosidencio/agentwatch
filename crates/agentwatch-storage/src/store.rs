@@ -265,6 +265,35 @@ fn insert_one(transaction: &Transaction<'_>, event: &AgentEvent) -> Result<usize
                 params![session_id.to_string(), parent_session_id.to_string()],
             )?;
         }
+
+        // Same reasoning, applied to the usage remainder. When the reader
+        // learns to extract something it previously walked past — as it did
+        // for `cache_miss_reason` — re-reading the transcript is the only way
+        // history can ever answer for it, and the event row is already here so
+        // nothing else in this function will run.
+        //
+        // Only the remainder is refreshed. The four counters are what the
+        // idempotency guarantee is about, and a total that cannot move is the
+        // point of it; a JSON blob beside them moves none. The `WHERE` keeps a
+        // pass over unchanged transcripts a genuine no-op.
+        if let Event::TokenUsage(usage) = &event.event {
+            let provider_usage = serde_json::to_string(&usage.provider_usage)?;
+            transaction.execute(
+                "UPDATE token_usage
+                    SET provider_usage = ?3
+                  WHERE agent_id = ?1 AND request_id = ?2
+                    AND provider_usage <> ?3",
+                params![
+                    event.agent_id.as_str(),
+                    usage
+                        .request_id
+                        .clone()
+                        .unwrap_or_else(|| event.id.to_string()),
+                    provider_usage,
+                ],
+            )?;
+        }
+
         return Ok(0);
     }
 
@@ -325,8 +354,9 @@ fn write_projection(
     match &event.event {
         Event::TokenUsage(usage) => {
             let provider_usage = serde_json::to_string(&usage.provider_usage)?;
-            // OR IGNORE plus the unique index on (agent_id, request_id) is what
-            // makes the reconcile pass safe to run repeatedly.
+            // The unique index on (agent_id, request_id) is what makes the
+            // reconcile pass safe to run repeatedly.
+            //
             transaction.execute(
                 "INSERT OR IGNORE INTO token_usage
                     (id, timestamp_us, agent_id, session_id, project_id, provider, model,
@@ -352,6 +382,7 @@ fn write_projection(
                     now,
                 ],
             )?;
+
         }
         Event::FileRead(file) => write_file(
             transaction,
@@ -422,12 +453,41 @@ fn write_projection(
                 params![id, timestamp, agent, session, project, mcp.server, mcp.tool, now],
             )?;
         }
+        Event::ToolOutcome(outcome) => {
+            transaction.execute(
+                "INSERT OR IGNORE INTO tool_outcomes
+                    (id, timestamp_us, agent_id, session_id, project_id, tool, tool_use_id,
+                     duration_ms, failed, created_at_us)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    id,
+                    timestamp,
+                    agent,
+                    session,
+                    project,
+                    outcome.tool,
+                    outcome.tool_use_id,
+                    outcome.duration_ms,
+                    i64::from(outcome.failed),
+                    now,
+                ],
+            )?;
+        }
         // No side table: the generic `events` row carries all of these, and
         // none has a per-kind dimension worth indexing separately.
+        // These need no projection of their own: the spine row carries
+        // everything they say. A posture change is deliberately here rather
+        // than in a table — it is read as a timeline, and there are only ever
+        // a handful per session.
         Event::SessionStarted(_)
         | Event::SessionEnded(_)
         | Event::Prompt(_)
         | Event::ToolCall(_)
+        | Event::PermissionMode(_)
+        | Event::Notification(_)
+        | Event::Queue(_)
+        | Event::TurnEnded(_)
+        | Event::ContextCompacted(_)
         | Event::ConfigChanged(_)
         | Event::Collection(_)
         | Event::Unknown(_) => {}

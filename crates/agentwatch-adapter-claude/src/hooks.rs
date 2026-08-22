@@ -1,8 +1,9 @@
 //! Hook payload parsing and mapping.
 
 use agentwatch_events::{
-    AdapterError, AgentEvent, Event, EvidenceSource, HookAdapter, HookEnvelope, PromptEvent,
-    SessionEnded, SessionStarted, UnknownEvent,
+    AdapterError, AgentEvent, ContextCompactedEvent, Event, EvidenceSource, HookAdapter,
+    HookEnvelope, NotificationEvent, PromptEvent, SessionEnded, SessionStarted, TurnEndedEvent,
+    UnknownEvent,
 };
 use agentwatch_types::{AgentId, EventId, ExternalSessionId};
 use serde::Deserialize;
@@ -95,6 +96,10 @@ struct HookPayload {
     source: Option<String>,
     /// For `SessionEnd`, why it ended.
     reason: Option<String>,
+    /// For `Notification`, what the agent is waiting for.
+    message: Option<String>,
+    /// For `PreCompact`, whether compaction was automatic or asked for.
+    trigger: Option<String>,
 }
 
 impl HookPayload {
@@ -134,6 +139,16 @@ impl HookPayload {
                 Event::Prompt(self.prompt_metadata())
             }
             Some("pretooluse" | "posttooluse") => self.tool_event(),
+            // The only signal here that no transcript can reconstruct: the
+            // agent waiting on a person.
+            Some("notification") => Event::Notification(NotificationEvent {
+                message: self.message.clone(),
+            }),
+            Some("stop") => Event::TurnEnded(TurnEndedEvent { subagent: false }),
+            Some("subagentstop") => Event::TurnEnded(TurnEndedEvent { subagent: true }),
+            Some("precompact") => Event::ContextCompacted(ContextCompactedEvent {
+                trigger: self.trigger.clone().or_else(|| self.source.clone()),
+            }),
             // `None` is a different failure from a name we do not recognise —
             // a payload with no name at all is malformed rather than merely
             // new — and the two are told apart by the label.
@@ -343,6 +358,40 @@ mod tests {
                 reason: Some("clear".into())
             })
         );
+    }
+
+    #[test]
+    fn the_waiting_and_boundary_hooks_are_mapped() {
+        use agentwatch_events::{ContextCompactedEvent, NotificationEvent, TurnEndedEvent};
+
+        let cases = [
+            (
+                r#"{"hook_event_name":"Notification","message":"Claude needs your permission"}"#,
+                Event::Notification(NotificationEvent {
+                    message: Some("Claude needs your permission".into()),
+                }),
+            ),
+            (
+                r#"{"hook_event_name":"Stop"}"#,
+                Event::TurnEnded(TurnEndedEvent { subagent: false }),
+            ),
+            (
+                // A subagent finishing must not read as the main thread
+                // finishing, or every spawned agent would end its parent's turn.
+                r#"{"hook_event_name":"SubagentStop"}"#,
+                Event::TurnEnded(TurnEndedEvent { subagent: true }),
+            ),
+            (
+                r#"{"hook_event_name":"PreCompact","trigger":"auto"}"#,
+                Event::ContextCompacted(ContextCompactedEvent {
+                    trigger: Some("auto".into()),
+                }),
+            ),
+        ];
+
+        for (payload, expected) in cases {
+            assert_eq!(normalize(payload).event, expected, "payload: {payload}");
+        }
     }
 
     #[test]

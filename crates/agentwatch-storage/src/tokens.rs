@@ -98,6 +98,12 @@ pub struct TokenDetail {
     pub web_search_requests: i64,
     /// Fetches the provider ran server-side.
     pub web_fetch_requests: i64,
+    /// Responses the provider served without using the prompt cache.
+    ///
+    /// A miss means paying full input price on a prompt that was expected to be
+    /// nearly free, so this is the counter that explains a cost spike no other
+    /// figure accounts for.
+    pub cache_misses: i64,
 }
 
 impl TokenDetail {
@@ -126,6 +132,7 @@ impl TokenDetail {
             && self.cache_write_1h == 0
             && self.web_search_requests == 0
             && self.web_fetch_requests == 0
+            && self.cache_misses == 0
     }
 }
 
@@ -322,7 +329,9 @@ impl Store {
                         0)), 0),
                     COALESCE(SUM(COALESCE(
                         json_extract(provider_usage, '$.server_tool_use.web_fetch_requests'),
-                        0)), 0)
+                        0)), 0),
+                    COALESCE(SUM(
+                        json_extract(provider_usage, '$.cache_miss_reason') IS NOT NULL), 0)
                FROM token_usage
               WHERE timestamp_us >= ?1 AND timestamp_us < ?2
               GROUP BY provider
@@ -339,6 +348,7 @@ impl Store {
                     cache_write_1h: row.get(4)?,
                     web_search_requests: row.get(5)?,
                     web_fetch_requests: row.get(6)?,
+                    cache_misses: row.get(7)?,
                 },
             ))
         })?;
@@ -790,6 +800,56 @@ mod tests {
         assert!(
             openai.is_empty() || openai.cache_write() == 0,
             "this provider reports no cache tiers"
+        );
+    }
+
+    #[test]
+    fn re_reading_enriches_the_remainder_without_moving_a_total() {
+        // A reader that learns to extract something new has to be able to
+        // apply it to history, or the feature only ever covers the future.
+        // What it must never do is change a count.
+        let build = |extra: &str| {
+            let provider_usage: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(extra).expect("valid remainder");
+            AgentEvent::observed(
+                AgentId::CLAUDE_CODE,
+                EvidenceSource::Transcript,
+                Event::TokenUsage(TokenUsageEvent {
+                    provider: "anthropic".into(),
+                    model: Some("m".into()),
+                    request_id: Some("r1".into()),
+                    input_tokens: 10,
+                    cache_creation_input_tokens: 20,
+                    cache_read_input_tokens: 30,
+                    output_tokens: 40,
+                    is_subagent: false,
+                    provider_usage,
+                }),
+            )
+            .with_id(EventId::from_key(&AgentId::CLAUDE_CODE, "r1"))
+            .with_session(ExternalSessionId::from("s-1".to_owned()))
+            .at(Timestamp::from_micros(1_000))
+        };
+
+        let mut store = Store::open_in_memory().expect("schema");
+        store.insert_events(&[build("{}")]).expect("first pass");
+        let before = store.token_totals(0, i64::MAX).expect("totals");
+
+        // The same response, re-read by a reader that now sees the cause.
+        store
+            .insert_events(&[build(r#"{"cache_miss_reason":"tools_changed"}"#)])
+            .expect("second pass");
+
+        let after = store.token_totals(0, i64::MAX).expect("totals");
+        assert_eq!(before, after, "a refresh must not move a single count");
+        assert_eq!(after.responses, 1, "and must not duplicate the response");
+
+        let detail = store
+            .token_detail_by_provider(0, i64::MAX)
+            .expect("detail");
+        assert_eq!(
+            detail[0].1.cache_misses, 1,
+            "the newly-extracted cause has to reach history, not just new rows"
         );
     }
 

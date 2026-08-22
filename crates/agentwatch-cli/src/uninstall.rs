@@ -632,7 +632,13 @@ mod tests {
             .iter()
             .find(|step| step.label == "hooks")
             .expect("hooks step");
-        assert!(matches!(hooks.action, Action::Hooks { removed: 4, .. }));
+        // One entry per registered event: the count is derived rather than
+        // written out, so growing `HOOK_EVENTS` cannot silently leave entries
+        // behind at uninstall.
+        assert!(matches!(
+            hooks.action,
+            Action::Hooks { removed, .. } if removed == install::HOOK_EVENTS.len()
+        ));
     }
 
     #[test]

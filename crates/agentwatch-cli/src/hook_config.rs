@@ -6,18 +6,7 @@
 //! the config of the thing it monitors has no business calling itself a
 //! security tool. This is here for anyone who would rather paste it themselves.
 
-/// Hooks we register.
-///
-/// `PreToolUse` is absent on purpose: with both installed every tool call would
-/// produce two events, and distinguishing "attempted" from "completed" needs
-/// the correlation work that lands in phase 2. `PostToolUse` alone means we
-/// record what actually ran.
-const HOOK_EVENTS: [&str; 4] = [
-    "SessionStart",
-    "SessionEnd",
-    "UserPromptSubmit",
-    "PostToolUse",
-];
+use crate::install::HOOK_EVENTS;
 
 /// Default command in a release install.
 ///
@@ -112,5 +101,18 @@ mod tests {
 
         let hooks = json.get("hooks").and_then(serde_json::Value::as_object);
         assert_eq!(hooks.map(serde_json::Map::len), Some(HOOK_EVENTS.len()));
+    }
+
+    #[test]
+    fn the_snippet_names_every_event_the_installer_registers() {
+        // These were once two separate lists. They drifted: `HOOK_EVENTS` grew
+        // to eight here while the installer's copy stayed at four, so
+        // `install-hooks` quietly wrote half the hooks and the printed snippet
+        // promised the rest. There is one constant now, and this asserts the
+        // snippet is generated from it rather than hand-maintained beside it.
+        let snippet = snippet(None);
+        for event in crate::install::HOOK_EVENTS {
+            assert!(snippet.contains(event), "snippet omits {event}");
+        }
     }
 }

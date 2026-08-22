@@ -38,7 +38,9 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-use agentwatch_events::{AgentEvent, Event, EvidenceSource, TokenUsageEvent};
+use agentwatch_events::{
+    AgentEvent, Event, EvidenceSource, PermissionModeEvent, QueueEvent, TokenUsageEvent, ToolOutcomeEvent,
+};
 
 use crate::tools::{self, ToolInput};
 use agentwatch_types::{AgentId, EventId, ExternalSessionId, Timestamp};
@@ -77,6 +79,15 @@ pub struct TranscriptSummary {
     pub responses: u64,
     /// Distinct tool calls recovered from the response content.
     pub tool_calls: u64,
+    /// Queue movements seen.
+    pub queue_operations: u64,
+    /// Times the permission posture changed.
+    pub permission_changes: u64,
+    /// Tool calls that were matched to the result that answered them.
+    ///
+    /// Lower than [`Self::tool_calls`] when a transcript ends mid-flight: the
+    /// last call has been made and not yet answered.
+    pub tool_outcomes: u64,
 }
 
 impl TranscriptSummary {
@@ -254,6 +265,15 @@ pub fn read_transcript_from<R: BufRead>(
     let mut events = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut seen_tools: HashSet<String> = HashSet::new();
+    // Calls waiting for their result: the tool that ran and when it started.
+    // A result arrives in a later record — for a long build, minutes and many
+    // records later — so the pairing cannot be done within one line.
+    let mut pending: std::collections::HashMap<String, (String, Timestamp)> =
+        std::collections::HashMap::new();
+    let mut seen_outcomes: HashSet<String> = HashSet::new();
+    // The posture in force. Only transitions are recorded: it holds until
+    // something says otherwise, so a row per turn would be noise.
+    let mut posture: Option<String> = None;
 
     for line in reader.lines() {
         let line = line?;
@@ -266,6 +286,63 @@ pub fn read_transcript_from<R: BufRead>(
             summary.unparseable_lines += 1;
             continue;
         };
+
+        // The queue moves while the agent is busy, so these records are the
+        // only measure of time the person spent waiting on it.
+        if record.kind.as_deref() == Some("queue-operation") {
+            if let Some(operation) = record.operation.as_deref() {
+                summary.queue_operations += 1;
+                events.push(queue_event(&record, operation));
+            }
+            continue;
+        }
+
+        // A `user` record carries the results of the calls the assistant made.
+        // Only `tool_use_id` and `is_error` are declared on the way in; the
+        // result's own `content` is named nowhere, so tool output cannot reach
+        // a value here any more than it can through `toolUseResult`.
+        if record.kind.as_deref() == Some("user") {
+            if let Some(mode) = record.permission_mode.as_deref()
+                && posture.as_deref() != Some(mode)
+            {
+                let previous = posture.replace(mode.to_owned());
+                summary.permission_changes += 1;
+                events.push(posture_event(&record, mode, previous));
+            }
+
+            let Some(message) = record.message.as_ref() else {
+                continue;
+            };
+            let finished = record
+                .timestamp
+                .as_deref()
+                .and_then(|at| Timestamp::parse_rfc3339(at).ok());
+
+            for block in &message.content {
+                if block.kind.as_deref() != Some("tool_result") {
+                    continue;
+                }
+                let Some(tool_use_id) = block.tool_use_id.as_deref() else {
+                    continue;
+                };
+                let Some((tool, started)) = pending.remove(tool_use_id) else {
+                    continue;
+                };
+                if !seen_outcomes.insert(tool_use_id.to_owned()) {
+                    continue;
+                }
+                summary.tool_outcomes += 1;
+
+                events.push(outcome_event(
+                    &record,
+                    tool,
+                    tool_use_id,
+                    duration_ms(started, finished),
+                    block.is_error,
+                ));
+            }
+            continue;
+        }
 
         if record.kind.as_deref() != Some("assistant") {
             continue;
@@ -291,6 +368,13 @@ pub fn read_transcript_from<R: BufRead>(
             summary.tool_calls += 1;
 
             let event = tools::tool_event(block.name.as_deref(), block.input.as_ref());
+            let started = record
+                .timestamp
+                .as_deref()
+                .and_then(|at| Timestamp::parse_rfc3339(at).ok());
+            if let (Some(tool), Some(started)) = (block.name.clone(), started) {
+                pending.insert(tool_use_id.to_owned(), (tool, started));
+            }
             events.push(activity_event(&record, event, tool_use_id));
         }
 
@@ -307,7 +391,13 @@ pub fn read_transcript_from<R: BufRead>(
         }
         summary.responses += 1;
 
-        events.push(to_event(&record, message.model, key, usage));
+        events.push(to_event(
+            &record,
+            message.model,
+            key,
+            usage,
+            message.diagnostics.as_ref(),
+        ));
     }
 
     Ok((events, summary))
@@ -338,11 +428,22 @@ fn activity_event(record: &TranscriptRecord, event: Event, tool_use_id: &str) ->
 }
 
 /// Builds one normalized event from a deduplicated response.
+/// Key the cache-miss cause is stored under in the usage remainder.
+///
+/// It rides in `provider_usage` rather than a column of its own because that
+/// map is exactly the designed place for a provider-reported detail this
+/// version has no schema for — "preserved rather than silently dropped, and
+/// promotable to a real column later without re-reading history". Promotion is
+/// cheap now that the remainder is read back; dropping it was the only
+/// unrecoverable option.
+const CACHE_MISS_KEY: &str = "cache_miss_reason";
+
 fn to_event(
     record: &TranscriptRecord,
     model: Option<String>,
     key: String,
     usage: serde_json::Map<String, serde_json::Value>,
+    diagnostics: Option<&Diagnostics>,
 ) -> AgentEvent {
     let mut token_usage = TokenUsageEvent {
         provider: PROVIDER.to_owned(),
@@ -360,6 +461,19 @@ fn to_event(
         if !KNOWN_USAGE_KEYS.contains(&key.as_str()) {
             token_usage.provider_usage.insert(key, value);
         }
+    }
+
+    // A cache miss means paying full input price on a prompt that was expected
+    // to be nearly free, and nothing else in the transcript explains a cost
+    // spike as directly. Only the cause is kept — a short enumerated string.
+    if let Some(reason) = diagnostics
+        .and_then(|diagnostics| diagnostics.cache_miss_reason.as_ref())
+        .and_then(|reason| reason.kind.as_deref())
+    {
+        token_usage.provider_usage.insert(
+            CACHE_MISS_KEY.to_owned(),
+            serde_json::Value::String(reason.to_owned()),
+        );
     }
 
     // Deterministic: reconciling the same transcript twice must produce the
@@ -386,6 +500,138 @@ fn to_event(
     }
 
     event
+        .with_git_branch(record.git_branch.clone())
+        .with_surface(record.entrypoint.clone())
+}
+
+/// Builds the event recording one queue movement.
+fn queue_event(record: &TranscriptRecord, operation: &str) -> AgentEvent {
+    // The same operation recurs constantly within a session, so the key has to
+    // carry the moment as well or a re-read would collapse them all into one.
+    let key = format!(
+        "queue:{}:{operation}:{}",
+        record.session_id.as_deref().unwrap_or_default(),
+        record.timestamp.as_deref().unwrap_or_default()
+    );
+
+    let mut built = AgentEvent::observed(
+        AgentId::CLAUDE_CODE,
+        EvidenceSource::Transcript,
+        Event::Queue(QueueEvent {
+            operation: operation.to_owned(),
+        }),
+    )
+    .with_id(EventId::from_key(&AgentId::CLAUDE_CODE, &key));
+
+    if let Some(timestamp) = record
+        .timestamp
+        .as_deref()
+        .and_then(|at| Timestamp::parse_rfc3339(at).ok())
+    {
+        built = built.at(timestamp);
+    }
+    if let Some(session) = record.session_id.clone() {
+        built = built.with_session(ExternalSessionId::from(session));
+    }
+    if let Some(cwd) = record.cwd.clone() {
+        built = built.with_project_path(cwd);
+    }
+
+    built
+        .with_git_branch(record.git_branch.clone())
+        .with_surface(record.entrypoint.clone())
+}
+
+/// Builds the event marking a change of permission posture.
+fn posture_event(record: &TranscriptRecord, mode: &str, previous: Option<String>) -> AgentEvent {
+    // Keyed on the session, the posture and the moment: re-reading the same
+    // transcript must not append the same transition twice, and the same
+    // posture legitimately recurs later in a session.
+    let key = format!(
+        "{}:{mode}:{}",
+        record.session_id.as_deref().unwrap_or_default(),
+        record.timestamp.as_deref().unwrap_or_default()
+    );
+
+    let mut built = AgentEvent::observed(
+        AgentId::CLAUDE_CODE,
+        EvidenceSource::Transcript,
+        Event::PermissionMode(PermissionModeEvent {
+            mode: mode.to_owned(),
+            previous,
+        }),
+    )
+    .with_id(EventId::from_key(&AgentId::CLAUDE_CODE, &key));
+
+    if let Some(timestamp) = record
+        .timestamp
+        .as_deref()
+        .and_then(|at| Timestamp::parse_rfc3339(at).ok())
+    {
+        built = built.at(timestamp);
+    }
+    if let Some(session) = record.session_id.clone() {
+        built = built.with_session(ExternalSessionId::from(session));
+    }
+    if let Some(cwd) = record.cwd.clone() {
+        built = built.with_project_path(cwd);
+    }
+
+    built
+        .with_git_branch(record.git_branch.clone())
+        .with_surface(record.entrypoint.clone())
+}
+
+/// Milliseconds between a call and its result, when both are known.
+///
+/// `None` rather than zero for a missing endpoint: a duration nobody measured
+/// is not an instant one, and averaging it as such would flatter every tool.
+/// A negative span is discarded for the same reason — clocks in a transcript
+/// come from whatever wrote it.
+fn duration_ms(started: Timestamp, finished: Option<Timestamp>) -> Option<u64> {
+    let finished = finished?;
+    let micros = finished.as_micros().checked_sub(started.as_micros())?;
+    u64::try_from(micros).ok().map(|micros| micros / 1_000)
+}
+
+/// Builds the event describing how one call turned out.
+fn outcome_event(
+    record: &TranscriptRecord,
+    tool: String,
+    tool_use_id: &str,
+    duration_ms: Option<u64>,
+    failed: bool,
+) -> AgentEvent {
+    // Keyed off the call's identifier with a suffix, so it is deterministic
+    // like everything else here and cannot collide with the call itself.
+    let key = format!("{tool_use_id}:outcome");
+    let mut built = AgentEvent::observed(
+        AgentId::CLAUDE_CODE,
+        EvidenceSource::Transcript,
+        Event::ToolOutcome(ToolOutcomeEvent {
+            tool,
+            tool_use_id: tool_use_id.to_owned(),
+            duration_ms,
+            failed,
+        }),
+    )
+    .with_id(EventId::from_key(&AgentId::CLAUDE_CODE, &key));
+
+    if let Some(timestamp) = record
+        .timestamp
+        .as_deref()
+        .and_then(|at| Timestamp::parse_rfc3339(at).ok())
+    {
+        built = built.at(timestamp);
+    }
+    if let Some(session) = record.session_id.clone() {
+        built = built.with_session(ExternalSessionId::from(session));
+    }
+    if let Some(cwd) = record.cwd.clone() {
+        built = built.with_project_path(cwd);
+    }
+
+    built
         .with_git_branch(record.git_branch.clone())
         .with_surface(record.entrypoint.clone())
 }
@@ -427,6 +673,14 @@ struct TranscriptRecord {
     entrypoint: Option<String>,
     /// Whether this turn belongs to a subagent rather than the main thread.
     is_sidechain: bool,
+    /// On a `queue-operation` record, what happened to the queue.
+    operation: Option<String>,
+    /// The permission posture in force, when the record says.
+    ///
+    /// Carried on `user` records. Not to be confused with the `mode` record
+    /// type, which is a different vocabulary describing the input mode and has
+    /// only ever held one value.
+    permission_mode: Option<String>,
     /// The model message.
     message: Option<TranscriptMessage>,
 }
@@ -446,8 +700,30 @@ struct TranscriptMessage {
     model: Option<String>,
     /// Reported usage, kept as a map so unknown categories survive.
     usage: Option<serde_json::Map<String, serde_json::Value>>,
+    /// What the provider noticed while serving the response.
+    ///
+    /// A sibling of `usage`, not part of it, which is why the remainder map
+    /// never picked it up: it was never offered to it.
+    diagnostics: Option<Diagnostics>,
     /// The response's content blocks, of which only `tool_use` is of interest.
     content: Vec<ContentBlock>,
+}
+
+/// Provider-side notes about how a response was served.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct Diagnostics {
+    /// Why the prompt cache was not used, when it was not.
+    cache_miss_reason: Option<CacheMissReason>,
+}
+
+/// The reason the prompt cache missed.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct CacheMissReason {
+    /// A short machine-readable cause, e.g. `previous_message_not_found`.
+    #[serde(rename = "type")]
+    kind: Option<String>,
 }
 
 /// One block of a model response.
@@ -470,6 +746,13 @@ struct ContentBlock {
     name: Option<String>,
     /// Its arguments, narrowed to the ones worth keeping.
     input: Option<ToolInput>,
+    /// On a `tool_result` block, the call it answers.
+    tool_use_id: Option<String>,
+    /// On a `tool_result` block, whether the tool reported failure.
+    ///
+    /// The result's own `content` is deliberately not declared beside it: the
+    /// flag is the telemetry, the output is not.
+    is_error: bool,
 }
 
 #[cfg(test)]
@@ -759,6 +1042,192 @@ mod tests {
         assert!(!encoded.contains("hunter2"), "thinking text leaked");
         assert!(!encoded.contains("AKIA"), "old_string leaked");
         assert!(!encoded.contains("redacted-please"), "new_string leaked");
+    }
+
+    #[test]
+    fn a_cache_miss_reason_is_kept_so_a_cost_spike_can_be_explained() {
+        // `diagnostics` sits beside `usage`, not inside it, which is exactly why
+        // the remainder map never picked it up on its own.
+        let text = r#"
+{"type":"assistant","timestamp":"2026-08-20T17:22:02.051Z","sessionId":"s-1","message":{"id":"msg_c","model":"m","diagnostics":{"cache_miss_reason":{"type":"previous_message_not_found"}},"usage":{"input_tokens":9,"output_tokens":1}}}
+"#;
+        let (events, _) = read(text);
+        let Event::TokenUsage(usage) = &events[0].event else {
+            panic!("expected token usage")
+        };
+        assert_eq!(
+            usage
+                .provider_usage
+                .get("cache_miss_reason")
+                .and_then(serde_json::Value::as_str),
+            Some("previous_message_not_found")
+        );
+    }
+
+    #[test]
+    fn a_response_that_hit_the_cache_records_no_reason() {
+        let (events, _) = read(ONE_RESPONSE_TWO_RECORDS);
+        let Event::TokenUsage(usage) = &events[0].event else {
+            panic!("expected token usage")
+        };
+        assert!(!usage.provider_usage.contains_key("cache_miss_reason"));
+    }
+
+    /// A call and the result that answers it, four seconds later.
+    const CALL_AND_RESULT: &str = r#"
+{"type":"assistant","timestamp":"2026-08-20T17:22:02.000Z","sessionId":"s-1","cwd":"/work","message":{"id":"msg_o","content":[{"type":"tool_use","id":"toolu_slow","name":"Bash","input":{"command":"cargo build"}}],"usage":{"output_tokens":1}}}
+{"type":"user","timestamp":"2026-08-20T17:22:06.000Z","sessionId":"s-1","cwd":"/work","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_slow","is_error":true,"content":"error: could not compile\nAKIAIOSFODNN7EXAMPLE"}]}}
+"#;
+
+    #[test]
+    fn a_tool_call_is_paired_with_its_result_for_duration_and_failure() {
+        let (events, summary) = read_all(CALL_AND_RESULT);
+        assert_eq!(summary.tool_outcomes, 1);
+
+        let outcome = events
+            .iter()
+            .find_map(|event| match &event.event {
+                Event::ToolOutcome(outcome) => Some(outcome),
+                _ => None,
+            })
+            .expect("an outcome");
+
+        assert_eq!(outcome.tool, "Bash");
+        assert_eq!(outcome.tool_use_id, "toolu_slow");
+        assert_eq!(outcome.duration_ms, Some(4_000));
+        assert!(outcome.failed);
+    }
+
+    #[test]
+    fn pairing_a_result_never_carries_its_output_through() {
+        // `is_error` is the telemetry; the text beside it is not, and the type
+        // that reads the block does not name it.
+        let (events, _) = read_all(CALL_AND_RESULT);
+        let encoded = serde_json::to_string(&events).expect("serializable");
+        assert!(!encoded.contains("AKIA"), "{encoded}");
+        assert!(!encoded.contains("could not compile"), "{encoded}");
+    }
+
+    #[test]
+    fn a_call_still_awaiting_its_result_yields_no_outcome() {
+        // What a transcript looks like while the tool is still running. The
+        // call is recorded; inventing an outcome for it would be a lie.
+        let (events, summary) = read_all(RESPONSE_WITH_TOOL_CALLS);
+        assert_eq!(summary.tool_calls, 2);
+        assert_eq!(summary.tool_outcomes, 0);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.event, Event::ToolOutcome(_)))
+        );
+    }
+
+    #[test]
+    fn outcomes_are_deterministic_and_do_not_collide_with_their_call() {
+        let (first, _) = read_all(CALL_AND_RESULT);
+        let (second, _) = read_all(CALL_AND_RESULT);
+        assert_eq!(first, second, "re-reading must not produce new rows");
+
+        let ids: std::collections::HashSet<_> = first.iter().map(|event| event.id).collect();
+        assert_eq!(ids.len(), first.len(), "the outcome must not shadow the call");
+    }
+
+    #[test]
+    fn a_result_with_no_matching_call_is_ignored() {
+        // Resuming a session mid-flight: the transcript can open on a result
+        // whose call was written to the previous file.
+        let text = r#"
+{"type":"user","timestamp":"2026-08-20T17:22:06.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_orphan","is_error":false}]}}
+"#;
+        let (events, summary) = read_all(text);
+        assert_eq!(summary.tool_outcomes, 0);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn queue_movements_are_recorded_without_the_message() {
+        let text = r#"
+{"type":"queue-operation","operation":"enqueue","timestamp":"2026-08-22T02:25:27.941Z","sessionId":"s-1"}
+{"type":"queue-operation","operation":"dequeue","timestamp":"2026-08-22T02:25:38.000Z","sessionId":"s-1"}
+"#;
+        let (events, summary) = read_all(text);
+        assert_eq!(summary.queue_operations, 2);
+
+        let operations: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                Event::Queue(queue) => Some(queue.operation.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(operations, vec!["enqueue", "dequeue"]);
+
+        // The gap between the two is the point: ten seconds the person spent
+        // waiting on the agent.
+        assert_eq!(
+            events[1].timestamp.as_micros() - events[0].timestamp.as_micros(),
+            10_059_000
+        );
+    }
+
+    #[test]
+    fn the_same_queue_operation_twice_is_two_events() {
+        // `enqueue` recurs constantly; keying on the operation alone would
+        // collapse a whole session's worth into one row.
+        let text = r#"
+{"type":"queue-operation","operation":"enqueue","timestamp":"2026-08-22T02:25:27.000Z","sessionId":"s-1"}
+{"type":"queue-operation","operation":"enqueue","timestamp":"2026-08-22T02:25:29.000Z","sessionId":"s-1"}
+"#;
+        let (events, _) = read_all(text);
+        let ids: std::collections::HashSet<_> = events.iter().map(|event| event.id).collect();
+        assert_eq!(ids.len(), 2);
+    }
+
+    #[test]
+    fn only_changes_of_permission_posture_are_recorded() {
+        // Four turns, two postures. Writing a row per turn would bury the two
+        // moments that actually matter in noise.
+        let text = r#"
+{"type":"user","timestamp":"2026-08-20T17:22:01.000Z","sessionId":"s-1","permissionMode":"default","message":{"content":[]}}
+{"type":"user","timestamp":"2026-08-20T17:22:02.000Z","sessionId":"s-1","permissionMode":"default","message":{"content":[]}}
+{"type":"user","timestamp":"2026-08-20T17:22:03.000Z","sessionId":"s-1","permissionMode":"acceptEdits","message":{"content":[]}}
+{"type":"user","timestamp":"2026-08-20T17:22:04.000Z","sessionId":"s-1","permissionMode":"acceptEdits","message":{"content":[]}}
+"#;
+        let (events, summary) = read_all(text);
+        assert_eq!(summary.permission_changes, 2);
+
+        let postures: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                Event::PermissionMode(mode) => Some((mode.mode.clone(), mode.previous.clone())),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            postures,
+            vec![
+                ("default".to_owned(), None),
+                ("acceptEdits".to_owned(), Some("default".to_owned())),
+            ],
+            "the first sighting is a starting state, not a change"
+        );
+    }
+
+    #[test]
+    fn a_posture_that_recurs_later_is_recorded_again() {
+        // Going back to `default` after a spell of `acceptEdits` is a real
+        // transition, so the id cannot be keyed on the posture alone.
+        let text = r#"
+{"type":"user","timestamp":"2026-08-20T17:22:01.000Z","sessionId":"s-1","permissionMode":"default","message":{"content":[]}}
+{"type":"user","timestamp":"2026-08-20T17:22:02.000Z","sessionId":"s-1","permissionMode":"acceptEdits","message":{"content":[]}}
+{"type":"user","timestamp":"2026-08-20T17:22:03.000Z","sessionId":"s-1","permissionMode":"default","message":{"content":[]}}
+"#;
+        let (events, summary) = read_all(text);
+        assert_eq!(summary.permission_changes, 3);
+
+        let ids: std::collections::HashSet<_> = events.iter().map(|event| event.id).collect();
+        assert_eq!(ids.len(), 3, "each transition is its own row");
     }
 
     #[test]
