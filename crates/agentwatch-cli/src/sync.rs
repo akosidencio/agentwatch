@@ -1,6 +1,8 @@
 //! Reading history out of transcripts, and checking that it stayed right.
 
-use agentwatch_adapter_claude::{find_transcripts, read_token_usage, transcript_root};
+use agentwatch_adapter_claude::{
+    find_transcripts, read_token_usage, read_transcript, transcript_root,
+};
 use agentwatch_adapter_codex::{find_rollouts, read_rollout, rollout_root};
 use agentwatch_events::Event;
 use agentwatch_storage::Store;
@@ -68,7 +70,7 @@ pub(crate) fn import(store: &mut Store, limit: Option<usize>) -> Result<ImportRe
         let events = match source {
             Source::Claude(file) => {
                 report.claude_files += 1;
-                let Ok((events, summary)) = read_token_usage(file) else {
+                let Ok((events, summary)) = read_transcript(file) else {
                     report.unreadable += 1;
                     continue;
                 };

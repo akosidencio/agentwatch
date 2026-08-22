@@ -18,15 +18,29 @@
 //!
 //! # What this reader never touches
 //!
-//! `message.content` and `toolUseResult` are not deserialized, so conversation
-//! text and tool output never enter memory — the same discipline the hook
-//! adapter applies, for the same reason.
+//! `toolUseResult` is not deserialized at all, so command output and file
+//! contents never enter memory.
+//!
+//! `message.content` **is** read, but only through a type that declares three
+//! fields: a block's `type`, a tool call's `id`, and its `name` and narrowed
+//! `input`. The assistant's prose and its thinking live in a `text` field that
+//! no type here names, so serde drops them while parsing rather than a later
+//! filter removing them. The narrowing of `input` is [`ToolInput`]'s job, and
+//! it omits `content`, `old_string`, and `new_string` for the same reason.
+//!
+//! This was a deliberate narrowing of an earlier, simpler rule — `content` used
+//! not to be deserialized at all — and it was made because the alternative was
+//! discarding the entire activity timeline of every session the hooks did not
+//! witness. The guarantee is now enforced by the shape of the types instead of
+//! by their absence, which is weaker to state and just as testable.
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use agentwatch_events::{AgentEvent, Event, EvidenceSource, TokenUsageEvent};
+
+use crate::tools::{self, ToolInput};
 use agentwatch_types::{AgentId, EventId, ExternalSessionId, Timestamp};
 use serde::Deserialize;
 
@@ -61,6 +75,8 @@ pub struct TranscriptSummary {
     pub usage_records: u64,
     /// Distinct responses those records represent.
     pub responses: u64,
+    /// Distinct tool calls recovered from the response content.
+    pub tool_calls: u64,
 }
 
 impl TranscriptSummary {
@@ -185,9 +201,59 @@ pub fn read_token_usage(
 pub fn read_token_usage_from<R: BufRead>(
     reader: R,
 ) -> Result<(Vec<AgentEvent>, TranscriptSummary), TranscriptError> {
+    let (events, summary) = read_transcript_from(reader)?;
+    Ok((
+        events
+            .into_iter()
+            .filter(|event| matches!(event.event, Event::TokenUsage(_)))
+            .collect(),
+        summary,
+    ))
+}
+
+/// Reads every event a transcript can account for: token usage and activity.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be opened or read.
+pub fn read_transcript(
+    path: impl AsRef<Path>,
+) -> Result<(Vec<AgentEvent>, TranscriptSummary), TranscriptError> {
+    let file = std::fs::File::open(path.as_ref())?;
+    read_transcript_from(BufReader::new(file))
+}
+
+/// Reads token usage *and* activity from any source of transcript lines.
+///
+/// # Why the transcript is read for activity at all
+///
+/// Hooks are the live path, but they only exist while they are installed and
+/// only from the moment they were. Everything before that — imported history,
+/// a session that predates the daemon, a machine where the hooks were removed —
+/// left a complete record of its tool calls in the transcript and nothing was
+/// reading it. The result was sessions with perfect token accounting and an
+/// empty timeline, which reported as "nothing observed" rather than "never
+/// looked at".
+///
+/// # Why re-reading is safe
+///
+/// Both kinds of event get a deterministic id: a response keys off its message
+/// id, and a tool call keys off the `tool_use` id the transcript assigns it.
+/// Reading the same file twice therefore produces the same rows, and storage's
+/// insert is idempotent on the primary key. That is also what lets the live
+/// hook and this reader describe the same tool call without duplicating it —
+/// provided the hook payload carries the same identifier.
+///
+/// # Errors
+///
+/// Returns an error if the underlying reader fails.
+pub fn read_transcript_from<R: BufRead>(
+    reader: R,
+) -> Result<(Vec<AgentEvent>, TranscriptSummary), TranscriptError> {
     let mut summary = TranscriptSummary::default();
     let mut events = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
+    let mut seen_tools: HashSet<String> = HashSet::new();
 
     for line in reader.lines() {
         let line = line?;
@@ -207,6 +273,27 @@ pub fn read_token_usage_from<R: BufRead>(
         let Some(message) = record.message.take() else {
             continue;
         };
+
+        // Activity first, and independently of usage: a response's blocks are
+        // repeated across its records, so they are deduplicated on their own
+        // key rather than riding on the usage dedup. A record that carried no
+        // usage at all would otherwise lose its tool calls.
+        for block in &message.content {
+            if block.kind.as_deref() != Some("tool_use") {
+                continue;
+            }
+            let Some(tool_use_id) = block.id.as_deref() else {
+                continue;
+            };
+            if !seen_tools.insert(tool_use_id.to_owned()) {
+                continue;
+            }
+            summary.tool_calls += 1;
+
+            let event = tools::tool_event(block.name.as_deref(), block.input.as_ref());
+            events.push(activity_event(&record, event, tool_use_id));
+        }
+
         let Some(usage) = message.usage else { continue };
         summary.usage_records += 1;
 
@@ -224,6 +311,30 @@ pub fn read_token_usage_from<R: BufRead>(
     }
 
     Ok((events, summary))
+}
+
+/// Builds one activity event, keyed so re-reading cannot duplicate it.
+fn activity_event(record: &TranscriptRecord, event: Event, tool_use_id: &str) -> AgentEvent {
+    let mut built = AgentEvent::observed(AgentId::CLAUDE_CODE, EvidenceSource::Transcript, event)
+        .with_id(EventId::from_key(&AgentId::CLAUDE_CODE, tool_use_id));
+
+    if let Some(timestamp) = record
+        .timestamp
+        .as_deref()
+        .and_then(|t| Timestamp::parse_rfc3339(t).ok())
+    {
+        built = built.at(timestamp);
+    }
+    if let Some(session) = record.session_id.clone() {
+        built = built.with_session(ExternalSessionId::from(session));
+    }
+    if let Some(cwd) = record.cwd.clone() {
+        built = built.with_project_path(cwd);
+    }
+
+    built
+        .with_git_branch(record.git_branch.clone())
+        .with_surface(record.entrypoint.clone())
 }
 
 /// Builds one normalized event from a deduplicated response.
@@ -322,8 +433,10 @@ struct TranscriptRecord {
 
 /// The subset of a model message worth reading.
 ///
-/// `content` is deliberately absent: not deserializing it is what guarantees
-/// conversation text cannot reach storage.
+/// `content` is read, but only through [`ContentBlock`], which names the three
+/// fields a tool call is identified by and nothing else. The assistant's prose
+/// and its thinking live in a `text` field that no type here declares, so they
+/// are dropped by the parser rather than by a later filter.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct TranscriptMessage {
@@ -333,11 +446,37 @@ struct TranscriptMessage {
     model: Option<String>,
     /// Reported usage, kept as a map so unknown categories survive.
     usage: Option<serde_json::Map<String, serde_json::Value>>,
+    /// The response's content blocks, of which only `tool_use` is of interest.
+    content: Vec<ContentBlock>,
+}
+
+/// One block of a model response.
+///
+/// Only `tool_use` blocks are acted on. `text` and `thinking` blocks parse into
+/// an all-`None` value and are skipped, which is the point: their payload field
+/// is not declared here, so conversation text cannot reach a Rust value.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ContentBlock {
+    /// `tool_use`, `text`, `thinking`, and others.
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    /// The provider's identifier for this tool call, e.g. `toolu_01H6Knd…`.
+    ///
+    /// The dedup key for activity, and the reason a transcript can be re-read
+    /// without duplicating the timeline.
+    id: Option<String>,
+    /// The tool invoked.
+    name: Option<String>,
+    /// Its arguments, narrowed to the ones worth keeping.
+    input: Option<ToolInput>,
 }
 
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+
+    use agentwatch_events::{CommandEvent, FileEvent};
 
     use super::*;
 
@@ -527,6 +666,108 @@ mod tests {
             !encoded.contains("AKIA"),
             "tool output must never be stored"
         );
+    }
+
+    /// A response carrying two tool calls, in the real shape.
+    const RESPONSE_WITH_TOOL_CALLS: &str = r#"
+{"type":"assistant","timestamp":"2026-08-20T17:22:02.051Z","sessionId":"s-1","cwd":"/work","gitBranch":"main","entrypoint":"claude-vscode","message":{"id":"msg_t","model":"claude-opus-5","content":[{"type":"thinking","text":"the launch code is hunter2"},{"type":"tool_use","id":"toolu_a","name":"Bash","input":{"command":"cargo test","description":"run tests"}},{"type":"tool_use","id":"toolu_b","name":"Edit","input":{"file_path":"/src/auth.rs","old_string":"AKIAIOSFODNN7EXAMPLE","new_string":"redacted-please"}}],"usage":{"input_tokens":1,"output_tokens":2}}}
+"#;
+
+    fn read_all(text: &str) -> (Vec<AgentEvent>, TranscriptSummary) {
+        read_transcript_from(Cursor::new(text)).expect("reads")
+    }
+
+    #[test]
+    fn recovers_the_activity_timeline_from_tool_use_blocks() {
+        // The gap this closes: a transcript holds every tool call a session
+        // made, and the reader used to walk past all of them for the usage
+        // figures alone.
+        let (events, summary) = read_all(RESPONSE_WITH_TOOL_CALLS);
+        assert_eq!(summary.tool_calls, 2);
+
+        let kinds: Vec<&str> = events.iter().map(AgentEvent::kind).collect();
+        assert_eq!(kinds, vec!["command", "file.write", "token.usage"]);
+
+        assert_eq!(
+            events[0].event,
+            Event::Command(CommandEvent {
+                command: "cargo test".into(),
+                description: Some("run tests".into()),
+            })
+        );
+        assert_eq!(
+            events[1].event,
+            Event::FileWrite(FileEvent {
+                path: "/src/auth.rs".into(),
+                tool: "Edit".into(),
+            })
+        );
+
+        // Activity inherits the session context the usage events already carry.
+        assert_eq!(events[0].project_path.as_deref(), Some("/work"));
+        assert_eq!(events[0].git_branch.as_deref(), Some("main"));
+        assert_eq!(events[0].surface.as_deref(), Some("claude-vscode"));
+        assert!(events[0].session_id.is_some());
+    }
+
+    #[test]
+    fn reading_a_transcript_twice_produces_identical_activity() {
+        // The whole idempotency story rests on this: reconcile runs repeatedly
+        // over a growing file, and a non-deterministic id would append the same
+        // tool call to the timeline on every pass.
+        let (first, _) = read_all(RESPONSE_WITH_TOOL_CALLS);
+        let (second, _) = read_all(RESPONSE_WITH_TOOL_CALLS);
+        assert_eq!(first, second);
+
+        let ids: Vec<_> = first.iter().map(|event| event.id).collect();
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(ids.len(), unique.len(), "ids must not collide");
+    }
+
+    #[test]
+    fn a_tool_call_is_recovered_even_when_its_record_reports_no_usage() {
+        // Activity is deduplicated on its own key rather than riding on the
+        // usage dedup, so a record with no usage still yields its tool calls.
+        let text = r#"
+{"type":"assistant","timestamp":"2026-08-20T17:22:02.051Z","sessionId":"s-1","message":{"id":"msg_n","content":[{"type":"tool_use","id":"toolu_lonely","name":"Read","input":{"file_path":"/etc/hosts"}}]}}
+"#;
+        let (events, summary) = read_all(text);
+        assert_eq!(summary.tool_calls, 1);
+        assert_eq!(summary.responses, 0, "no usage, so no response counted");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind(), "file.read");
+    }
+
+    #[test]
+    fn one_tool_call_is_counted_once_though_its_response_spans_records() {
+        // The same rule that governs usage: a response's blocks repeat across
+        // the records it is split over.
+        let doubled = format!("{RESPONSE_WITH_TOOL_CALLS}{RESPONSE_WITH_TOOL_CALLS}");
+        let (events, summary) = read_all(&doubled);
+        assert_eq!(summary.tool_calls, 2, "not four");
+        assert_eq!(events.iter().filter(|e| e.kind() == "command").count(), 1);
+    }
+
+    #[test]
+    fn reading_activity_still_keeps_prose_and_patch_bodies_out() {
+        // The privacy rule, now that `content` is parsed rather than skipped.
+        // `thinking` text and an `Edit`'s replacement string are both present in
+        // the input and must not survive the parse.
+        let (events, _) = read_all(RESPONSE_WITH_TOOL_CALLS);
+        let encoded = serde_json::to_string(&events).expect("serializable");
+
+        assert!(!encoded.contains("hunter2"), "thinking text leaked");
+        assert!(!encoded.contains("AKIA"), "old_string leaked");
+        assert!(!encoded.contains("redacted-please"), "new_string leaked");
+    }
+
+    #[test]
+    fn the_token_usage_reader_still_returns_only_usage() {
+        // `verify` computes drift from this function and must not start seeing
+        // activity events, or every transcript would look like it had drifted.
+        let (events, _) = read(RESPONSE_WITH_TOOL_CALLS);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0].event, Event::TokenUsage(_)));
     }
 
     #[test]

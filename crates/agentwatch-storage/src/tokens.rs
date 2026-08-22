@@ -62,6 +62,73 @@ pub struct TokenGroup {
     pub totals: TokenTotals,
 }
 
+/// Counters the provider reported that the four headline figures do not cover.
+///
+/// # Why these were invisible
+///
+/// Ingestion keeps everything a provider sends: whatever is not one of the four
+/// known counters is preserved verbatim in `provider_usage`. That was the right
+/// call and it worked — but nothing ever read it back, so counters worth
+/// millions of tokens sat in the database with no way to see them short of
+/// writing SQL by hand. Reading them needs no new collection and no re-import;
+/// the rows already say all of this.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TokenDetail {
+    /// Tokens spent reasoning before answering.
+    ///
+    /// Normalized across providers on purpose. Anthropic reports it as
+    /// `output_tokens_details.thinking_tokens` and OpenAI as
+    /// `reasoning_output_tokens`; they are the same quantity under two names,
+    /// they are both a subset of output tokens, and unlike the headline
+    /// counters they *are* comparable — so this is one of the few figures that
+    /// can honestly be added across providers.
+    pub reasoning: i64,
+    /// Output tokens over the same rows, so the reasoning share is computable.
+    pub output: i64,
+    /// Cache writes on the five-minute TTL.
+    ///
+    /// Kept apart from the one-hour tier for the same reason cache creation is
+    /// kept apart from cache read: the two are priced differently, and a total
+    /// that blends them cannot be un-blended afterwards.
+    pub cache_write_5m: i64,
+    /// Cache writes on the one-hour TTL.
+    pub cache_write_1h: i64,
+    /// Searches the provider ran server-side, which are metered separately.
+    pub web_search_requests: i64,
+    /// Fetches the provider ran server-side.
+    pub web_fetch_requests: i64,
+}
+
+impl TokenDetail {
+    /// What fraction of output was spent reasoning, as a percentage.
+    ///
+    /// Returns `None` when there was no output to divide by.
+    #[must_use]
+    pub fn reasoning_share(&self) -> Option<f64> {
+        (self.output > 0).then(|| self.reasoning as f64 * 100.0 / self.output as f64)
+    }
+
+    /// Every cache write, whichever tier it landed on.
+    #[must_use]
+    pub const fn cache_write(&self) -> i64 {
+        self.cache_write_5m + self.cache_write_1h
+    }
+
+    /// Whether the provider reported any of this at all.
+    ///
+    /// Used to skip the section rather than print a block of zeroes for a
+    /// provider that simply does not report these categories.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.reasoning == 0
+            && self.cache_write_5m == 0
+            && self.cache_write_1h == 0
+            && self.web_search_requests == 0
+            && self.web_fetch_requests == 0
+    }
+}
+
 impl Store {
     /// Sums token usage over a half-open time range.
     ///
@@ -154,12 +221,18 @@ impl Store {
 
     /// Breaks token usage down by model, largest first.
     ///
+    /// Labels are qualified with the provider that served them. A bare model
+    /// list reads as one uniform ranking, and it is not one: the counters
+    /// underneath `claude-opus-5` and `gpt-5.6-sol` are produced by different
+    /// tokenizers and priced on different terms, so the provider is part of
+    /// the model's identity rather than decoration on it.
+    ///
     /// # Errors
     ///
     /// Returns an error if the database cannot be queried.
     pub fn tokens_by_model(&self, from_us: i64, to_us: i64) -> Result<Vec<TokenGroup>, StoreError> {
         self.token_groups(
-            "SELECT COALESCE(model, '(unknown)'),
+            "SELECT provider || '/' || COALESCE(model, '(unknown)'),
                     COALESCE(SUM(input_tokens), 0),
                     COALESCE(SUM(cache_creation_input_tokens), 0),
                     COALESCE(SUM(cache_read_input_tokens), 0),
@@ -167,12 +240,114 @@ impl Store {
                     COUNT(*)
                FROM token_usage
               WHERE timestamp_us >= ?1 AND timestamp_us < ?2
-              GROUP BY model
+              GROUP BY provider, model
               ORDER BY SUM(input_tokens) + SUM(cache_creation_input_tokens)
                      + SUM(cache_read_input_tokens) + SUM(output_tokens) DESC",
             from_us,
             to_us,
         )
+    }
+
+    /// Breaks token usage down by provider, largest first.
+    ///
+    /// # Why this is not just another grouping
+    ///
+    /// The four counters are comparable *within* a provider and not across
+    /// one. Anthropic reports almost all of its input as cache reads while
+    /// OpenAI reports none of it as cache writes at all, so a summed "cache
+    /// write" figure silently means "Anthropic only", and a summed "input"
+    /// figure adds two differently-defined quantities measured by two
+    /// different tokenizers.
+    ///
+    /// This is the same argument that keeps cache creation apart from cache
+    /// read, one level up: a merge that cannot be undone downstream has to not
+    /// happen at ingestion or at the surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be queried.
+    pub fn tokens_by_provider(
+        &self,
+        from_us: i64,
+        to_us: i64,
+    ) -> Result<Vec<TokenGroup>, StoreError> {
+        self.token_groups(
+            "SELECT provider,
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(cache_creation_input_tokens), 0),
+                    COALESCE(SUM(cache_read_input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0),
+                    COUNT(*)
+               FROM token_usage
+              WHERE timestamp_us >= ?1 AND timestamp_us < ?2
+              GROUP BY provider
+              ORDER BY SUM(input_tokens) + SUM(cache_creation_input_tokens)
+                     + SUM(cache_read_input_tokens) + SUM(output_tokens) DESC",
+            from_us,
+            to_us,
+        )
+    }
+
+    /// Reads the promoted `provider_usage` counters, per provider.
+    ///
+    /// Nothing here is recomputed from scratch: every value is already stored
+    /// on the row, and this only reaches into the JSON to add it up. Existing
+    /// history therefore answers these questions immediately, with no import.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be queried.
+    pub fn token_detail_by_provider(
+        &self,
+        from_us: i64,
+        to_us: i64,
+    ) -> Result<Vec<(String, TokenDetail)>, StoreError> {
+        let mut statement = self.connection().prepare(
+            // COALESCE across the two spellings of reasoning tokens: whichever
+            // the provider used, at most one is present on a given row.
+            "SELECT provider,
+                    COALESCE(SUM(COALESCE(
+                        json_extract(provider_usage, '$.output_tokens_details.thinking_tokens'),
+                        json_extract(provider_usage, '$.reasoning_output_tokens'),
+                        0)), 0),
+                    COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(COALESCE(
+                        json_extract(provider_usage, '$.cache_creation.ephemeral_5m_input_tokens'),
+                        0)), 0),
+                    COALESCE(SUM(COALESCE(
+                        json_extract(provider_usage, '$.cache_creation.ephemeral_1h_input_tokens'),
+                        0)), 0),
+                    COALESCE(SUM(COALESCE(
+                        json_extract(provider_usage, '$.server_tool_use.web_search_requests'),
+                        0)), 0),
+                    COALESCE(SUM(COALESCE(
+                        json_extract(provider_usage, '$.server_tool_use.web_fetch_requests'),
+                        0)), 0)
+               FROM token_usage
+              WHERE timestamp_us >= ?1 AND timestamp_us < ?2
+              GROUP BY provider
+              ORDER BY provider",
+        )?;
+
+        let rows = statement.query_map(params![from_us, to_us], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                TokenDetail {
+                    reasoning: row.get(1)?,
+                    output: row.get(2)?,
+                    cache_write_5m: row.get(3)?,
+                    cache_write_1h: row.get(4)?,
+                    web_search_requests: row.get(5)?,
+                    web_fetch_requests: row.get(6)?,
+                },
+            ))
+        })?;
+
+        let mut detail = Vec::new();
+        for row in rows {
+            detail.push(row?);
+        }
+        Ok(detail)
     }
 
     /// Breaks token usage down by coding agent, largest first.
@@ -528,11 +703,167 @@ mod tests {
     }
 
     #[test]
-    fn model_breakdown_groups_by_exact_identifier() {
+    fn model_breakdown_groups_by_exact_identifier_and_names_its_provider() {
         let groups = seeded().tokens_by_model(0, 10_000_000).expect("groups");
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].label, "claude-opus-5");
+        assert_eq!(
+            groups[0].label, "anthropic/claude-opus-5",
+            "a model ranking without its provider reads as one uniform list \
+             when it is not"
+        );
         assert_eq!(groups[0].totals.responses, 3);
+    }
+
+    #[test]
+    fn the_provider_usage_remainder_is_readable_without_reimporting() {
+        // Both spellings of reasoning tokens, and the TTL split, exactly as the
+        // two providers write them.
+        let with_usage = |agent: &AgentId, provider: &str, request_id: &str, extra: &str| {
+            let provider_usage: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(extra).expect("valid usage remainder");
+            AgentEvent::observed(
+                agent.clone(),
+                EvidenceSource::Transcript,
+                Event::TokenUsage(TokenUsageEvent {
+                    provider: provider.to_owned(),
+                    model: Some("m".into()),
+                    request_id: Some(request_id.to_owned()),
+                    input_tokens: 1,
+                    cache_creation_input_tokens: 300,
+                    cache_read_input_tokens: 0,
+                    output_tokens: 1_000,
+                    is_subagent: false,
+                    provider_usage,
+                }),
+            )
+            .with_id(EventId::from_key(agent, request_id))
+            .with_session(ExternalSessionId::from("s-1".to_owned()))
+            .at(Timestamp::from_micros(1_000))
+        };
+
+        let mut store = Store::open_in_memory().expect("schema");
+        store
+            .insert_events(&[
+                with_usage(
+                    &AgentId::CLAUDE_CODE,
+                    "anthropic",
+                    "a1",
+                    r#"{"output_tokens_details":{"thinking_tokens":250},
+                        "cache_creation":{"ephemeral_5m_input_tokens":100,
+                                          "ephemeral_1h_input_tokens":200},
+                        "server_tool_use":{"web_search_requests":3,"web_fetch_requests":1}}"#,
+                ),
+                with_usage(
+                    &AgentId::CODEX,
+                    "openai",
+                    "o1",
+                    r#"{"reasoning_output_tokens":400}"#,
+                ),
+            ])
+            .expect("insert");
+
+        let detail = store
+            .token_detail_by_provider(0, i64::MAX)
+            .expect("detail");
+        let of = |name: &str| {
+            detail
+                .iter()
+                .find(|(provider, _)| provider == name)
+                .map(|(_, found)| *found)
+                .expect("provider present")
+        };
+
+        let anthropic = of("anthropic");
+        assert_eq!(anthropic.reasoning, 250);
+        assert_eq!(anthropic.cache_write_5m, 100);
+        assert_eq!(anthropic.cache_write_1h, 200);
+        assert_eq!(anthropic.cache_write(), 300);
+        assert_eq!(anthropic.web_search_requests, 3);
+        assert_eq!(anthropic.web_fetch_requests, 1);
+        assert_eq!(anthropic.reasoning_share(), Some(25.0));
+
+        // The other spelling of the same quantity has to land in the same field,
+        // or reasoning cannot be compared or added across providers.
+        let openai = of("openai");
+        assert_eq!(openai.reasoning, 400);
+        assert_eq!(openai.reasoning_share(), Some(40.0));
+        assert!(
+            openai.is_empty() || openai.cache_write() == 0,
+            "this provider reports no cache tiers"
+        );
+    }
+
+    #[test]
+    fn a_provider_reporting_no_extras_is_reported_as_empty() {
+        // `usage()` carries an empty remainder, which must not render a block
+        // of zeroes at the surface.
+        let detail = seeded()
+            .token_detail_by_provider(0, i64::MAX)
+            .expect("detail");
+        assert!(detail[0].1.is_empty());
+        assert_eq!(detail[0].1.reasoning_share(), Some(0.0));
+    }
+
+    #[test]
+    fn providers_are_broken_out_and_never_merged() {
+        // The counters mean different things per provider: this fixture mirrors
+        // the real shape, where one provider reports cache writes and the other
+        // structurally reports none.
+        let openai = |request_id: &str, micros: i64| {
+            AgentEvent::observed(
+                AgentId::CODEX,
+                EvidenceSource::Transcript,
+                Event::TokenUsage(TokenUsageEvent {
+                    provider: "openai".into(),
+                    model: Some("gpt-5.6-sol".into()),
+                    request_id: Some(request_id.to_owned()),
+                    input_tokens: 500,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 100,
+                    output_tokens: 7,
+                    is_subagent: false,
+                    provider_usage: serde_json::Map::new(),
+                }),
+            )
+            .with_id(EventId::from_key(&AgentId::CODEX, request_id))
+            .with_session(ExternalSessionId::from("s-2".to_owned()))
+            .at(Timestamp::from_micros(micros))
+        };
+
+        let mut store = Store::open_in_memory().expect("schema");
+        store
+            .insert_events(&[
+                usage("m1", 1_000, 5, "/work"),
+                openai("o1", 2_000),
+                openai("o2", 3_000),
+            ])
+            .expect("insert");
+
+        let providers = store.tokens_by_provider(0, i64::MAX).expect("providers");
+        assert_eq!(providers.len(), 2, "one row per provider");
+
+        let openai_row = providers
+            .iter()
+            .find(|group| group.label == "openai")
+            .expect("openai present");
+        assert_eq!(openai_row.totals.responses, 2);
+        assert_eq!(
+            openai_row.totals.cache_creation, 0,
+            "this provider reports no cache writes; summing it with one that \
+             does would attribute the whole figure to the wrong place"
+        );
+
+        let anthropic_row = providers
+            .iter()
+            .find(|group| group.label == "anthropic")
+            .expect("anthropic present");
+        assert_eq!(anthropic_row.totals.cache_creation, 20);
+
+        // Models stay separable too, which is the point of qualifying them.
+        let models = store.tokens_by_model(0, i64::MAX).expect("models");
+        let labels: Vec<&str> = models.iter().map(|g| g.label.as_str()).collect();
+        assert!(labels.contains(&"openai/gpt-5.6-sol"), "{labels:?}");
+        assert!(labels.contains(&"anthropic/claude-opus-5"), "{labels:?}");
     }
 
     #[test]

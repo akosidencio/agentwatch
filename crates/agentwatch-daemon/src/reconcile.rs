@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use agentwatch_adapter_claude::{derived_transcript_path, read_token_usage, transcript_root};
+use agentwatch_adapter_claude::{derived_transcript_path, read_transcript, transcript_root};
 use agentwatch_adapter_codex::{find_rollouts, read_rollout, rollout_root};
 use agentwatch_storage::{PendingSession, Store, StoreError};
 use agentwatch_types::{RepositoryResolver, Timestamp};
@@ -78,7 +78,7 @@ pub fn reconcile_session(
         return Ok(report);
     };
 
-    let Ok((events, summary)) = read_token_usage(&path) else {
+    let Ok((events, summary)) = read_transcript(&path) else {
         report.missing_transcripts = 1;
         store.mark_reconcile_attempted(&session.session_id, now)?;
         return Ok(report);

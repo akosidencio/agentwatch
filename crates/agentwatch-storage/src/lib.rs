@@ -25,4 +25,4 @@ pub use repositories::BackfillReport;
 pub use security::Notable;
 pub use sessions::{ActivityFilter, Coverage, SessionFilter, SessionRow};
 pub use store::{Store, StoreError};
-pub use tokens::{PendingSession, TokenGroup, TokenTotals};
+pub use tokens::{PendingSession, TokenDetail, TokenGroup, TokenTotals};

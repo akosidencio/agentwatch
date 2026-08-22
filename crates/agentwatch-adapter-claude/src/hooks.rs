@@ -1,20 +1,15 @@
 //! Hook payload parsing and mapping.
 
 use agentwatch_events::{
-    AdapterError, AgentEvent, CommandEvent, Event, EvidenceSource, FileEvent, HookAdapter,
-    HookEnvelope, McpEvent, PromptEvent, SessionEnded, SessionStarted, ToolCallEvent, UnknownEvent,
+    AdapterError, AgentEvent, Event, EvidenceSource, HookAdapter, HookEnvelope, PromptEvent,
+    SessionEnded, SessionStarted, UnknownEvent,
 };
-use agentwatch_types::{AgentId, ExternalSessionId};
+use agentwatch_types::{AgentId, EventId, ExternalSessionId};
 use serde::Deserialize;
 
 use crate::SOURCE;
 use crate::redact;
-
-/// Prefix Claude Code puts on MCP tool names.
-const MCP_PREFIX: &str = "mcp__";
-
-/// Separator between server and tool inside an MCP tool name.
-const MCP_SEPARATOR: &str = "__";
+use crate::tools::{self, ToolInput};
 
 /// The Claude Code adapter.
 #[derive(Debug, Clone, Copy, Default)]
@@ -43,6 +38,14 @@ impl HookAdapter for ClaudeAdapter {
             payload.to_event(),
         )
         .at(envelope.sent_at);
+
+        // Key the event on the tool call's own identifier when the agent sends
+        // one. The transcript names the same call the same way, so the live
+        // event and the one recovered by a later reconcile become the same row
+        // rather than two records of one action.
+        if let Some(tool_use_id) = payload.tool_use_id.as_deref() {
+            event = event.with_id(EventId::from_key(&AgentId::CLAUDE_CODE, tool_use_id));
+        }
 
         if let Some(session) = payload.session_id {
             event = event.with_session(ExternalSessionId::from(session));
@@ -78,6 +81,14 @@ struct HookPayload {
     tool_name: Option<String>,
     /// For tool hooks, the arguments it ran with.
     tool_input: Option<ToolInput>,
+    /// The agent's identifier for this specific tool call, when it sends one.
+    ///
+    /// The same identifier the transcript writes on the `tool_use` block, which
+    /// makes it the one key both observation paths can agree on. When it is
+    /// present the live event and the reconciled one derive the same event id
+    /// and storage collapses them into a single row; when it is absent the two
+    /// paths each record the call and the timeline double-counts it.
+    tool_use_id: Option<String>,
     /// For prompt hooks, the prompt text. Summarized, never stored.
     prompt: Option<String>,
     /// For `SessionStart`, how the session began.
@@ -86,38 +97,48 @@ struct HookPayload {
     reason: Option<String>,
 }
 
-/// The subset of tool arguments worth keeping.
-///
-/// Notably absent: `content`, `old_string`, and `new_string`, so file contents
-/// never enter memory.
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct ToolInput {
-    /// Target of a file tool.
-    file_path: Option<String>,
-    /// Target of a notebook tool.
-    notebook_path: Option<String>,
-    /// The command line for `Bash`.
-    command: Option<String>,
-    /// The agent's own description of a command.
-    description: Option<String>,
-}
-
 impl HookPayload {
     /// Maps the payload onto a normalized event.
+    ///
+    /// # Why the name is lowercased before it is matched
+    ///
+    /// The hook name is not spelled consistently across surfaces. Payloads
+    /// observed on this machine carry `postToolUse` and `sessionStart` where
+    /// the documented spelling is `PostToolUse` and `SessionStart`, and an
+    /// exact match sent all of them to [`Event::Unknown`] — which meant a tool
+    /// call arrived with its file path or command line in hand and was stored
+    /// as a bare label. Casing is not a distinction this payload ever intends
+    /// to make, so it is not one worth honouring.
+    ///
+    /// The label on an unrecognised event keeps its **original** casing: it is
+    /// the only evidence of what the agent actually said, and normalizing it
+    /// would hide the very difference someone reads it to diagnose.
     fn to_event(&self) -> Event {
-        match self.hook_event_name.as_deref() {
-            Some("SessionStart") => Event::SessionStarted(SessionStarted {
+        let raw = self.hook_event_name.as_deref();
+
+        match raw.map(str::to_ascii_lowercase).as_deref() {
+            Some("sessionstart") => Event::SessionStarted(SessionStarted {
                 trigger: self.source.clone(),
                 transcript_path: self.transcript_path.clone(),
             }),
-            Some("SessionEnd") => Event::SessionEnded(SessionEnded {
+            Some("sessionend") => Event::SessionEnded(SessionEnded {
                 reason: self.reason.clone(),
             }),
-            Some("UserPromptSubmit") => Event::Prompt(self.prompt_metadata()),
-            Some("PreToolUse" | "PostToolUse") => self.tool_event(),
-            other => Event::Unknown(UnknownEvent {
-                label: other.unwrap_or("missing_hook_event_name").to_owned(),
+            // `beforeSubmitPrompt` is a second name for the same moment, seen
+            // in payloads alongside the documented one. It is mapped here
+            // rather than left unknown because the alternative is losing the
+            // prompt metadata entirely; if it should ever turn out to carry no
+            // `prompt` field, `prompt_metadata` already degrades to a zero
+            // count rather than inventing one.
+            Some("userpromptsubmit" | "beforesubmitprompt") => {
+                Event::Prompt(self.prompt_metadata())
+            }
+            Some("pretooluse" | "posttooluse") => self.tool_event(),
+            // `None` is a different failure from a name we do not recognise —
+            // a payload with no name at all is malformed rather than merely
+            // new — and the two are told apart by the label.
+            _ => Event::Unknown(UnknownEvent {
+                label: raw.unwrap_or("missing_hook_event_name").to_owned(),
             }),
         }
     }
@@ -137,81 +158,16 @@ impl HookPayload {
 
     /// Maps a tool call onto the most specific event it fits.
     ///
-    /// Falls back to a generic tool call rather than inventing a path or a
-    /// command that the payload did not contain.
+    /// Delegates to the shared classifier so a hook and a transcript describe
+    /// the same call the same way.
     fn tool_event(&self) -> Event {
-        let Some(tool) = self.tool_name.as_deref() else {
-            return Event::Unknown(UnknownEvent {
-                label: "missing_tool_name".to_owned(),
-            });
-        };
-
-        if let Some(rest) = tool.strip_prefix(MCP_PREFIX) {
-            return mcp_event(tool, rest);
-        }
-
-        let input = self.tool_input.as_ref();
-        let file_path = input.and_then(|input| {
-            input
-                .file_path
-                .as_deref()
-                .or(input.notebook_path.as_deref())
-        });
-
-        match tool {
-            "Read" | "NotebookRead" => match file_path {
-                Some(path) => Event::FileRead(FileEvent {
-                    path: path.to_owned(),
-                    tool: tool.to_owned(),
-                }),
-                None => generic_tool(tool),
-            },
-            "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => match file_path {
-                Some(path) => Event::FileWrite(FileEvent {
-                    path: path.to_owned(),
-                    tool: tool.to_owned(),
-                }),
-                None => generic_tool(tool),
-            },
-            "Bash" | "BashOutput" => match input.and_then(|input| input.command.as_deref()) {
-                Some(command) => Event::Command(CommandEvent {
-                    command: command.to_owned(),
-                    description: input.and_then(|input| input.description.clone()),
-                }),
-                None => generic_tool(tool),
-            },
-            _ => generic_tool(tool),
-        }
+        tools::tool_event(self.tool_name.as_deref(), self.tool_input.as_ref())
     }
-}
-
-/// Splits `mcp__server__tool` into its parts.
-fn mcp_event(full_name: &str, rest: &str) -> Event {
-    match rest.split_once(MCP_SEPARATOR) {
-        Some((server, tool)) if !server.is_empty() && !tool.is_empty() => {
-            Event::McpCall(McpEvent {
-                server: server.to_owned(),
-                tool: tool.to_owned(),
-            })
-        }
-        // A prefixed name we cannot split is still an MCP call; record it whole
-        // rather than guessing at a server boundary that is not there.
-        _ => Event::McpCall(McpEvent {
-            server: "unknown".to_owned(),
-            tool: full_name.to_owned(),
-        }),
-    }
-}
-
-/// Wraps a tool this version does not model specifically.
-fn generic_tool(tool: &str) -> Event {
-    Event::ToolCall(ToolCallEvent {
-        tool: tool.to_owned(),
-    })
 }
 
 #[cfg(test)]
 mod tests {
+    use agentwatch_events::{CommandEvent, FileEvent, McpEvent, ToolCallEvent};
     use agentwatch_types::Timestamp;
     use serde_json::value::RawValue;
 
@@ -396,6 +352,114 @@ mod tests {
             event.event,
             Event::Unknown(UnknownEvent {
                 label: "SomeFutureHook".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_tool_use_id_makes_the_live_event_and_the_transcript_agree() {
+        use agentwatch_types::EventId;
+
+        let event = normalize(
+            r#"{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_use_id":"toolu_abc",
+                "tool_input":{"command":"cargo test"}}"#,
+        );
+
+        // The transcript reader derives its id from the same string. If these
+        // ever diverge the timeline double-counts every tool call a live
+        // session made and a later reconcile re-read.
+        assert_eq!(
+            event.id,
+            EventId::from_key(&AgentId::CLAUDE_CODE, "toolu_abc")
+        );
+    }
+
+    #[test]
+    fn without_a_tool_use_id_the_event_still_gets_one_of_its_own() {
+        // Older agents, and hooks other than the tool ones, send no such id.
+        // They must still produce an event; they just cannot be reconciled
+        // against the transcript by identity.
+        let first = normalize(r#"{"hook_event_name":"PostToolUse","tool_name":"Glob"}"#);
+        let second = normalize(r#"{"hook_event_name":"PostToolUse","tool_name":"Glob"}"#);
+        assert_ne!(first.id, second.id, "two calls are two events");
+    }
+
+    #[test]
+    fn hook_names_are_matched_whatever_their_casing() {
+        // Not hypothetical: every one of these spellings was found in the
+        // database on the development machine, stored as `unknown` because the
+        // match was exact. `postToolUse` alone accounted for 31 tool calls
+        // whose file path or command line was discarded.
+        let cases = [
+            (
+                r#"{"hook_event_name":"sessionStart","source":"startup"}"#,
+                Event::SessionStarted(SessionStarted {
+                    trigger: Some("startup".into()),
+                    transcript_path: None,
+                }),
+            ),
+            (
+                r#"{"hook_event_name":"sessionEnd","reason":"clear"}"#,
+                Event::SessionEnded(SessionEnded {
+                    reason: Some("clear".into()),
+                }),
+            ),
+            (
+                r#"{"hook_event_name":"postToolUse","tool_name":"Read",
+                    "tool_input":{"file_path":"/src/auth.rs"}}"#,
+                Event::FileRead(FileEvent {
+                    path: "/src/auth.rs".into(),
+                    tool: "Read".into(),
+                }),
+            ),
+            (
+                r#"{"hook_event_name":"PRETOOLUSE","tool_name":"Bash",
+                    "tool_input":{"command":"cargo test"}}"#,
+                Event::Command(CommandEvent {
+                    command: "cargo test".into(),
+                    description: None,
+                }),
+            ),
+        ];
+
+        for (payload, expected) in cases {
+            assert_eq!(normalize(payload).event, expected, "payload: {payload}");
+        }
+    }
+
+    #[test]
+    fn before_submit_prompt_is_a_prompt_like_any_other() {
+        let event = normalize(
+            r#"{"hook_event_name":"beforeSubmitPrompt","prompt":"my secret plan"}"#,
+        );
+
+        let Event::Prompt(prompt) = event.event else {
+            panic!("expected a prompt event");
+        };
+        assert_eq!(prompt.char_count, 14);
+        assert!(prompt.sha256.is_some());
+    }
+
+    #[test]
+    fn an_unrecognised_label_keeps_the_casing_the_agent_used() {
+        // The label is the only record of what actually arrived. Lowercasing it
+        // to match would erase the difference someone reads it to diagnose.
+        let event = normalize(r#"{"hook_event_name":"someFutureHook"}"#);
+        assert_eq!(
+            event.event,
+            Event::Unknown(UnknownEvent {
+                label: "someFutureHook".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_payload_with_no_hook_name_is_distinguishable_from_an_unknown_one() {
+        let event = normalize(r#"{"tool_name":"Read"}"#);
+        assert_eq!(
+            event.event,
+            Event::Unknown(UnknownEvent {
+                label: "missing_hook_event_name".into()
             })
         );
     }

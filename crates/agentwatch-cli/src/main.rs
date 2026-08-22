@@ -20,7 +20,9 @@ mod welcome;
 
 use std::path::PathBuf;
 
-use agentwatch_storage::{ActivityFilter, Coverage, SessionFilter, Store, TokenTotals};
+use agentwatch_storage::{
+    ActivityFilter, Coverage, SessionFilter, Store, TokenDetail, TokenGroup, TokenTotals,
+};
 use agentwatch_types::{Paths, Timestamp};
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
@@ -47,6 +49,8 @@ struct Cli {
 enum Grouping {
     /// By coding agent.
     Agent,
+    /// By the provider that served the request.
+    Provider,
     /// By repository, rolling up every directory inside it.
     Project,
     /// By the exact working directory the session started in.
@@ -170,6 +174,9 @@ enum Command {
         /// Show at most this many rows in the breakdown.
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Also show reasoning tokens, the cache-write TTL split, and server tools.
+        #[arg(long)]
+        detail: bool,
     },
     /// Add our hooks to the agent's settings, after showing the diff.
     InstallHooks {
@@ -390,7 +397,17 @@ fn main() -> Result<()> {
             to,
             all,
             limit,
-        } => tokens(&paths, by, days, from.as_deref(), to.as_deref(), all, limit),
+            detail,
+        } => tokens(
+            &paths,
+            by,
+            days,
+            from.as_deref(),
+            to.as_deref(),
+            all,
+            limit,
+            detail,
+        ),
         Command::InstallHooks {
             binary,
             settings,
@@ -409,7 +426,9 @@ fn main() -> Result<()> {
             agent,
         } => sessions(&paths, days, limit, coverage, agent),
         Command::Session { id } => session(&paths, &id),
-        Command::Compare { by, days, limit } => tokens(&paths, by, days, None, None, false, limit),
+        Command::Compare { by, days, limit } => {
+            tokens(&paths, by, days, None, None, false, limit, false)
+        }
         Command::Activity {
             days,
             limit,
@@ -545,6 +564,50 @@ fn status(paths: &Paths) -> Result<()> {
     counter("active sessions", totals.active_sessions);
     counter("projects", totals.projects);
 
+    print_unknown_events(&store, totals.unknown_events)?;
+
+    Ok(())
+}
+
+/// Warns when the adapter has stopped understanding what it is being sent.
+///
+/// Silent only when there is nothing to say. Every other counter in `status` is
+/// a measure of work observed; this one is a measure of work *missed*, and it
+/// is the difference between a monitor that is healthy and one that merely
+/// looks it — an unrecognised payload is still recorded, still counted in
+/// `events`, and still missing the file path or command line it arrived with.
+fn print_unknown_events(store: &Store, unknown: i64) -> Result<()> {
+    if unknown == 0 {
+        return Ok(());
+    }
+
+    let labels = store
+        .unknown_event_labels(4)
+        .context("reading unrecognised event labels")?;
+    let named = labels
+        .iter()
+        .map(|(label, count)| format!("{label} ({count})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // The glyph and the wording carry the state on their own, so the warning
+    // still reads as a warning with colour stripped or piped away.
+    println!();
+    println!(
+        "{}",
+        theme::paint(
+            &format!("⚠ {unknown} events not understood — {named}"),
+            theme::WARN
+        )
+    );
+    println!(
+        "{}",
+        theme::paint(
+            "  Their detail was dropped at collection. Upgrade, or report these names.",
+            theme::MUTED
+        )
+    );
+
     Ok(())
 }
 
@@ -558,6 +621,7 @@ fn tokens(
     to: Option<&str>,
     all: bool,
     limit: usize,
+    detail: bool,
 ) -> Result<()> {
     let store = open_for_reading(paths)?;
     let (zone, zone_is_local) = range::local_zone();
@@ -577,10 +641,22 @@ fn tokens(
         println!("(times in UTC: the local timezone could not be determined)");
     }
     println!();
-    print_totals(&totals);
+
+    let providers = store
+        .tokens_by_provider(range.from_us, range.to_us)
+        .context("reading the provider split")?;
+    let detail = if detail {
+        store
+            .token_detail_by_provider(range.from_us, range.to_us)
+            .context("reading the provider detail")?
+    } else {
+        Vec::new()
+    };
+    print_provider_totals(&providers, &totals, &detail);
 
     let groups = match by {
         Grouping::Agent => store.tokens_by_agent(range.from_us, range.to_us),
+        Grouping::Provider => store.tokens_by_provider(range.from_us, range.to_us),
         Grouping::Project => store.tokens_by_repository(range.from_us, range.to_us),
         Grouping::Directory => store.tokens_by_project(range.from_us, range.to_us),
         Grouping::Model => store.tokens_by_model(range.from_us, range.to_us),
@@ -627,10 +703,135 @@ fn tokens(
 const fn by_label(by: Grouping) -> &'static str {
     match by {
         Grouping::Agent => "agent",
+        Grouping::Provider => "provider",
         Grouping::Project => "repository",
         Grouping::Directory => "directory",
         Grouping::Model => "model",
         Grouping::Day => "day",
+    }
+}
+
+/// Prints one counter block per provider, then what may honestly be combined.
+///
+/// # Why the headline is not a single block
+///
+/// The four counters mean different things to different providers. Anthropic
+/// serves nearly all of its input from the prompt cache and reports it under
+/// `cache read`; OpenAI reports no cache *writes* at all. Summed, the cache
+/// write line silently describes one provider, and the input line adds two
+/// quantities that were not measured the same way — by tokenizers that do not
+/// agree on what a token is.
+///
+/// So the per-provider blocks are the answer, and the combined footer totals
+/// only what survives being added up: how many responses there were. The token
+/// sum is still printed, because refusing to show it would be its own kind of
+/// dishonesty, but it is labelled for what it is.
+///
+/// A single provider gets no footer — there is nothing to combine, and the
+/// caveat would be noise.
+fn print_provider_totals(
+    providers: &[TokenGroup],
+    overall: &TokenTotals,
+    detail: &[(String, TokenDetail)],
+) {
+    let detail_for = |label: &str| {
+        detail
+            .iter()
+            .find(|(provider, _)| provider == label)
+            .map(|(_, found)| found)
+    };
+
+    if providers.len() <= 1 {
+        print_totals(overall);
+        if let Some(only) = providers.first()
+            && let Some(found) = detail_for(&only.label)
+        {
+            print_detail(found);
+        }
+        return;
+    }
+
+    for provider in providers {
+        println!("  {}", theme::bold(&provider.label));
+        print_totals(&provider.totals);
+        if let Some(found) = detail_for(&provider.label) {
+            print_detail(found);
+        }
+        println!();
+    }
+
+    println!("  {}", theme::bold("all providers"));
+    println!(
+        "  {}  {:>15}",
+        theme::paint(&format!("{:<13}", "responses"), theme::MUTED),
+        render::thousands(overall.responses)
+    );
+    println!(
+        "  {}  {:>15}",
+        theme::paint(&format!("{:<13}", "tokens"), theme::MUTED),
+        render::thousands(overall.total())
+    );
+    println!(
+        "  {}",
+        theme::paint(
+            "tokens above are summed across different tokenizers — compare per provider",
+            theme::MUTED
+        )
+    );
+}
+
+/// Prints the counters the provider reported beyond the headline four.
+///
+/// Silent when the provider reported none of them, rather than printing a
+/// column of zeroes for a provider that does not have the concept. Percentages
+/// are shown against the figure they are a subset of — reasoning against
+/// output, each cache tier against total cache write — because the absolute
+/// number alone does not say whether it is worth acting on.
+fn print_detail(detail: &TokenDetail) {
+    if detail.is_empty() {
+        return;
+    }
+
+    println!("  {}", theme::paint("detail", theme::MUTED));
+
+    // Padded and right-aligned before any colour is applied: widening a string
+    // that already carries escape sequences counts those bytes as width.
+    let line = |label: &str, value: i64, note: &str| {
+        println!(
+            "  {}  {:>15}{}",
+            theme::paint(&format!("{label:<13}"), theme::MUTED),
+            render::thousands(value),
+            theme::paint(note, theme::MUTED)
+        );
+    };
+
+    if let Some(share) = detail.reasoning_share().filter(|_| detail.reasoning > 0) {
+        line(
+            "reasoning",
+            detail.reasoning,
+            &format!("   {share:.1}% of output"),
+        );
+    }
+
+    // The TTL split only means something when something was written, and the
+    // two tiers are priced differently — which is the whole reason to show
+    // them apart rather than folded into the single cache-write figure above.
+    let cache_write = detail.cache_write();
+    if cache_write > 0 {
+        for (label, value) in [
+            ("cache 5m", detail.cache_write_5m),
+            ("cache 1h", detail.cache_write_1h),
+        ] {
+            let share = value as f64 * 100.0 / cache_write as f64;
+            line(label, value, &format!("   {share:.1}% of cache write"));
+        }
+    }
+
+    if detail.web_search_requests > 0 {
+        line("web search", detail.web_search_requests, "");
+    }
+    if detail.web_fetch_requests > 0 {
+        line("web fetch", detail.web_fetch_requests, "");
     }
 }
 

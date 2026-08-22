@@ -189,12 +189,18 @@ agentwatch watch                           # live view, while an agent is workin
 ```sh
 agentwatch tokens                                   # today, by repository
 agentwatch tokens --days 7 --by day
+agentwatch tokens --all --by provider               # one block per provider
+agentwatch tokens --all --detail                    # reasoning tokens, cache TTL split
 agentwatch tokens --all --by project --limit 10     # rolled up to repositories
 agentwatch tokens --all --by directory              # exact working directories
 agentwatch tokens --from 2026-08-01 --to 2026-08-21 --by model
 ```
 
 Four counters are tracked separately — input, output, cache creation, and cache read — because providers bill them very differently and merging them at ingestion would make cost estimation permanently unfixable.
+
+`--detail` reads counters the provider sent that the four headline figures do not cover, and it needs no new collection: they were already being preserved verbatim at ingestion, so existing history answers immediately. Reasoning tokens are normalised across providers — Anthropic calls them `output_tokens_details.thinking_tokens`, OpenAI calls them `reasoning_output_tokens`, and unlike the headline counters they *are* comparable, being a subset of output either way. Cache writes are split by TTL, because the five-minute and one-hour tiers are priced differently and a blended total cannot be un-blended later.
+
+**Providers are reported apart, for the same reason.** The counters are comparable within a provider and not across one: Anthropic serves nearly all of its input from the prompt cache and reports it as cache reads, while OpenAI reports no cache *writes* at all. Summed, the cache-write line silently describes one provider and the input line adds two quantities that different tokenizers measured differently. So the headline is one block per provider, and the combined footer totals what actually survives addition — the response count — with the token sum shown but labelled as a cross-tokenizer figure. With only one provider in range there is nothing to combine and the footer is omitted. `--by model` qualifies each model with the provider that served it, so `anthropic/claude-opus-5` and `openai/gpt-5.6-sol` are never two rows of an apparently uniform ranking.
 
 ### Sessions and activity
 

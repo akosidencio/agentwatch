@@ -53,6 +53,14 @@ pub struct Totals {
     pub active_sessions: i64,
     /// Distinct projects seen.
     pub projects: i64,
+    /// Events the adapter could not classify.
+    ///
+    /// Reported because it is the one counter that says AgentWatch has stopped
+    /// understanding its own input. An adapter that silently files new payloads
+    /// under `unknown` keeps collecting and keeps looking healthy while the
+    /// detail it was installed to capture is discarded — which is exactly what
+    /// happened when hook names began arriving in a different case.
+    pub unknown_events: i64,
 }
 
 impl Store {
@@ -67,7 +75,8 @@ impl Store {
                 (SELECT COUNT(*) FROM events),
                 (SELECT COUNT(*) FROM sessions),
                 (SELECT COUNT(*) FROM sessions WHERE status = 'active'),
-                (SELECT COUNT(*) FROM projects)",
+                (SELECT COUNT(*) FROM projects),
+                (SELECT COUNT(*) FROM events WHERE kind = 'unknown')",
             [],
             |row| {
                 Ok(Totals {
@@ -75,10 +84,37 @@ impl Store {
                     sessions: row.get(1)?,
                     active_sessions: row.get(2)?,
                     projects: row.get(3)?,
+                    unknown_events: row.get(4)?,
                 })
             },
         )?;
         Ok(totals)
+    }
+
+    /// Names what the adapter could not classify, most frequent first.
+    ///
+    /// A bare count tells you something is wrong; the labels tell you what to
+    /// fix, and they are the only surviving evidence of the payload — the rest
+    /// of it was dropped at normalization. Rows whose payload carries no label
+    /// are grouped under `(no label)` rather than silently vanishing from a
+    /// report whose entire job is to show what went unrecognised.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be queried.
+    pub fn unknown_event_labels(&self, limit: usize) -> Result<Vec<(String, i64)>, StoreError> {
+        let mut statement = self.connection().prepare(
+            "SELECT COALESCE(json_extract(payload, '$.label'), '(no label)'), COUNT(*)
+               FROM events
+              WHERE kind = 'unknown'
+              GROUP BY 1
+              ORDER BY 2 DESC, 1 ASC
+              LIMIT ?1",
+        )?;
+        let rows = statement
+            .query_map([limit], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Reads the most recent events, newest first.
@@ -139,6 +175,49 @@ mod tests {
         assert_eq!(
             totals.active_sessions, 0,
             "these events never reported a session starting, so nothing is known to be running"
+        );
+    }
+
+    #[test]
+    fn unclassified_events_are_counted_and_named() {
+        use agentwatch_events::UnknownEvent;
+
+        let unknown = |label: &str, micros: i64| {
+            AgentEvent::observed(
+                AgentId::CLAUDE_CODE,
+                EvidenceSource::Hook,
+                Event::Unknown(UnknownEvent {
+                    label: label.to_owned(),
+                }),
+            )
+            .at(Timestamp::from_micros(micros))
+        };
+
+        let mut store = Store::open_in_memory().expect("schema");
+        store
+            .insert_events(&[
+                event_at(1_000, "ls"),
+                unknown("postToolUse", 2_000),
+                unknown("postToolUse", 3_000),
+                unknown("beforeSubmitPrompt", 4_000),
+            ])
+            .expect("insert");
+
+        let totals = store.totals().expect("totals");
+        assert_eq!(totals.events, 4);
+        assert_eq!(
+            totals.unknown_events, 3,
+            "only unclassified events count, not every event"
+        );
+
+        let labels = store.unknown_event_labels(10).expect("labels");
+        assert_eq!(
+            labels,
+            vec![
+                ("postToolUse".to_owned(), 2),
+                ("beforeSubmitPrompt".to_owned(), 1),
+            ],
+            "most frequent first, so the biggest loss is named first"
         );
     }
 
