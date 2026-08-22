@@ -28,7 +28,8 @@ mod transcript;
 pub use hooks::ClaudeAdapter;
 pub use transcript::{
     TranscriptError, TranscriptSummary, derived_transcript_path, find_transcripts,
-    read_token_usage, read_token_usage_from, read_transcript, read_transcript_from, transcript_root,
+    read_token_usage, read_token_usage_from, read_transcript, read_transcript_from,
+    transcript_root,
 };
 
 /// The `source` value the Claude hook binary puts in its envelopes.

@@ -382,7 +382,6 @@ fn write_projection(
                     now,
                 ],
             )?;
-
         }
         Event::FileRead(file) => write_file(
             transaction,

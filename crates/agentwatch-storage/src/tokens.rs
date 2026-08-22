@@ -772,9 +772,7 @@ mod tests {
             ])
             .expect("insert");
 
-        let detail = store
-            .token_detail_by_provider(0, i64::MAX)
-            .expect("detail");
+        let detail = store.token_detail_by_provider(0, i64::MAX).expect("detail");
         let of = |name: &str| {
             detail
                 .iter()
@@ -844,9 +842,7 @@ mod tests {
         assert_eq!(before, after, "a refresh must not move a single count");
         assert_eq!(after.responses, 1, "and must not duplicate the response");
 
-        let detail = store
-            .token_detail_by_provider(0, i64::MAX)
-            .expect("detail");
+        let detail = store.token_detail_by_provider(0, i64::MAX).expect("detail");
         assert_eq!(
             detail[0].1.cache_misses, 1,
             "the newly-extracted cause has to reach history, not just new rows"

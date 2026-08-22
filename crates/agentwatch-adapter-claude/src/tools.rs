@@ -16,9 +16,7 @@
 //! applies to `toolUseResult`, and it is enforced by the shape of the struct
 //! rather than by remembering to avoid a field.
 
-use agentwatch_events::{
-    CommandEvent, Event, FileEvent, McpEvent, ToolCallEvent, UnknownEvent,
-};
+use agentwatch_events::{CommandEvent, Event, FileEvent, McpEvent, ToolCallEvent, UnknownEvent};
 use serde::Deserialize;
 
 /// Prefix Claude Code puts on MCP tool names.
@@ -95,10 +93,12 @@ pub(crate) fn tool_event(tool: Option<&str>, input: Option<&ToolInput>) -> Event
 /// Splits `mcp__server__tool` into its parts.
 fn mcp_event(full_name: &str, rest: &str) -> Event {
     match rest.split_once(MCP_SEPARATOR) {
-        Some((server, tool)) if !server.is_empty() && !tool.is_empty() => Event::McpCall(McpEvent {
-            server: server.to_owned(),
-            tool: tool.to_owned(),
-        }),
+        Some((server, tool)) if !server.is_empty() && !tool.is_empty() => {
+            Event::McpCall(McpEvent {
+                server: server.to_owned(),
+                tool: tool.to_owned(),
+            })
+        }
         // A prefixed name we cannot split is still an MCP call; record it whole
         // rather than guessing at a server boundary that is not there.
         _ => Event::McpCall(McpEvent {

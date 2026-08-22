@@ -39,7 +39,8 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use agentwatch_events::{
-    AgentEvent, Event, EvidenceSource, PermissionModeEvent, QueueEvent, TokenUsageEvent, ToolOutcomeEvent,
+    AgentEvent, Event, EvidenceSource, PermissionModeEvent, QueueEvent, TokenUsageEvent,
+    ToolOutcomeEvent,
 };
 
 use crate::tools::{self, ToolInput};
@@ -1129,7 +1130,11 @@ mod tests {
         assert_eq!(first, second, "re-reading must not produce new rows");
 
         let ids: std::collections::HashSet<_> = first.iter().map(|event| event.id).collect();
-        assert_eq!(ids.len(), first.len(), "the outcome must not shadow the call");
+        assert_eq!(
+            ids.len(),
+            first.len(),
+            "the outcome must not shadow the call"
+        );
     }
 
     #[test]

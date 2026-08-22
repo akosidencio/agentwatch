@@ -763,7 +763,10 @@ fn churn(paths: &Paths, days: u32, all: bool, limit: usize) -> Result<()> {
     println!(
         "{}",
         theme::paint(
-            &format!("{:>7}{:>8}{:>10}  {}", "writes", "reads", "sessions", "file"),
+            &format!(
+                "{:>7}{:>8}{:>10}  {}",
+                "writes", "reads", "sessions", "file"
+            ),
             theme::MUTED
         )
     );
@@ -845,7 +848,10 @@ fn sql(paths: &Paths, query: Option<&str>, as_json: bool) -> Result<()> {
     };
 
     // Padded before painting: escape bytes count as width otherwise.
-    println!("{}", theme::paint(&line(result.columns.clone()), theme::MUTED));
+    println!(
+        "{}",
+        theme::paint(&line(result.columns.clone()), theme::MUTED)
+    );
     for row in &result.rows {
         println!("{}", line(row.iter().map(cell).collect()));
     }
@@ -906,7 +912,11 @@ fn reliability(paths: &Paths, days: u32, all: bool, limit: usize) -> Result<()> 
             format!("{:>8}", "—")
         } else {
             let text = format!("{:>7.1}%", rate);
-            let colour = if rate >= 10.0 { theme::BAD } else { theme::WARN };
+            let colour = if rate >= 10.0 {
+                theme::BAD
+            } else {
+                theme::WARN
+            };
             // Padded before painting: escape bytes count as width otherwise.
             format!("{}{}", " ", theme::paint(&text, colour))
         };
@@ -923,7 +933,11 @@ fn reliability(paths: &Paths, days: u32, all: bool, limit: usize) -> Result<()> 
     }
 
     if report.len() > limit {
-        println!("... and {} more (--limit {})", report.len() - limit, report.len());
+        println!(
+            "... and {} more (--limit {})",
+            report.len() - limit,
+            report.len()
+        );
     }
 
     // Said once, under the table, because the `max` column invites exactly the

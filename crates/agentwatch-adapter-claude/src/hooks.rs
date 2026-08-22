@@ -478,9 +478,8 @@ mod tests {
 
     #[test]
     fn before_submit_prompt_is_a_prompt_like_any_other() {
-        let event = normalize(
-            r#"{"hook_event_name":"beforeSubmitPrompt","prompt":"my secret plan"}"#,
-        );
+        let event =
+            normalize(r#"{"hook_event_name":"beforeSubmitPrompt","prompt":"my secret plan"}"#);
 
         let Event::Prompt(prompt) = event.event else {
             panic!("expected a prompt event");
