@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use agentwatch_events::{
     AgentEvent, CommandEvent, Event, EvidenceSource, FileEvent, SessionEnded, SessionStarted,
-    TokenUsageEvent, ToolCallEvent,
+    TokenUsageEvent, ToolCallEvent, ToolOutcomeEvent,
 };
 use agentwatch_types::{AgentId, EventId, ExternalSessionId, Timestamp};
 use serde::Deserialize;
@@ -36,6 +36,8 @@ pub struct RolloutSummary {
     pub commands: u64,
     /// Changed file paths recovered without reading patch bodies.
     pub file_writes: u64,
+    /// Tool calls paired with the output that answered them.
+    pub tool_outcomes: u64,
 }
 
 /// Returns `$CODEX_HOME/sessions`, or `~/.codex/sessions` by default.
@@ -148,6 +150,8 @@ struct State {
     surface: Option<String>,
     is_subagent: bool,
     seen_usage: HashSet<String>,
+    /// Calls awaiting the output that answers them: the tool and when it began.
+    pending_tools: std::collections::HashMap<String, (String, Timestamp)>,
 }
 
 impl State {
@@ -288,7 +292,17 @@ impl State {
                 EventMessage::Other => {}
             },
             Payload::ResponseItem(item) => match item {
-                ResponseItem::CustomToolCall { name, input } if name == "exec" => {
+                ResponseItem::CustomToolCall {
+                    name,
+                    input,
+                    call_id,
+                } if name == "exec" => {
+                    // Remembered so the output that answers it can be paired
+                    // back into a duration and a pass or fail.
+                    if let Some(call_id) = call_id {
+                        self.pending_tools
+                            .insert(call_id, (name.clone(), timestamp));
+                    }
                     for (call_index, call) in exec_calls(&input).into_iter().enumerate() {
                         if let Some(workdir) = call.workdir {
                             self.project = Some(workdir);
@@ -304,12 +318,48 @@ impl State {
                         summary.commands += 1;
                     }
                 }
-                ResponseItem::CustomToolCall { name, .. } | ResponseItem::FunctionCall { name } => {
+                ResponseItem::CustomToolCall { name, call_id, .. }
+                | ResponseItem::FunctionCall { name, call_id } => {
+                    if let Some(call_id) = call_id {
+                        self.pending_tools
+                            .insert(call_id, (name.clone(), timestamp));
+                    }
                     events.push(self.event(
                         Event::ToolCall(ToolCallEvent { tool: name }),
                         timestamp,
                         &format!("line:{line_index}:tool"),
                     ))
+                }
+                ResponseItem::CustomToolCallOutput { call_id, output }
+                | ResponseItem::FunctionCallOutput { call_id, output } => {
+                    let Some(call_id) = call_id else { return };
+                    let Some((tool, started)) = self.pending_tools.remove(&call_id) else {
+                        return;
+                    };
+
+                    // Only the first chunk is consulted. It is the runner's own
+                    // status line; everything after it is the command's output.
+                    let failed = output.first().is_some_and(OutputChunk::reports_failure);
+                    let duration_ms = u64::try_from(
+                        timestamp
+                            .as_micros()
+                            .saturating_sub(started.as_micros())
+                            .max(0),
+                    )
+                    .ok()
+                    .map(|micros| micros / 1_000);
+
+                    events.push(self.event(
+                        Event::ToolOutcome(ToolOutcomeEvent {
+                            tool,
+                            tool_use_id: call_id.clone(),
+                            duration_ms,
+                            failed,
+                        }),
+                        timestamp,
+                        &format!("outcome:{call_id}"),
+                    ));
+                    summary.tool_outcomes += 1;
                 }
                 ResponseItem::Other => {}
             },
@@ -485,12 +535,96 @@ enum ResponseItem {
     CustomToolCall {
         name: String,
         input: String,
+        #[serde(default)]
+        call_id: Option<String>,
     },
     FunctionCall {
         name: String,
+        #[serde(default)]
+        call_id: Option<String>,
+    },
+    CustomToolCallOutput {
+        #[serde(default)]
+        call_id: Option<String>,
+        #[serde(default)]
+        output: Vec<OutputChunk>,
+    },
+    FunctionCallOutput {
+        #[serde(default)]
+        call_id: Option<String>,
+        #[serde(default)]
+        output: Vec<OutputChunk>,
     },
     #[serde(other)]
     Other,
+}
+
+/// One piece of a tool's reported output.
+///
+/// The first piece is a status preamble the runner writes — `Script completed`
+/// or `Script failed`, followed by a wall time. The pieces after it are the
+/// command's actual output, and that is not ours to keep.
+#[derive(Debug, Deserialize)]
+struct OutputChunk {
+    #[serde(default)]
+    text: Option<StatusPrefix>,
+}
+
+/// At most [`STATUS_PREFIX_BYTES`] of a text field, truncated during parsing.
+///
+/// The status a tool reports and the output it produced arrive in the same
+/// array of strings, so the status cannot be read without the parser touching
+/// the output. What it can be denied is the chance to *keep* it: the visitor
+/// below truncates on the way in, so the longest value this type can ever hold
+/// is a few dozen bytes — enough for `Script failed`, nowhere near enough for a
+/// command's output. serde hands the visitor a borrowed slice for a string with
+/// no escapes, so in the ordinary case the full text is never allocated at all.
+#[derive(Debug)]
+struct StatusPrefix(String);
+
+/// How much of a text field is retained.
+///
+/// Sized for the longest status line the runner is known to write, with room
+/// for one that is longer. Deliberately far too small to hold output.
+const STATUS_PREFIX_BYTES: usize = 48;
+
+impl<'de> Deserialize<'de> for StatusPrefix {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = StatusPrefix;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a string")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                // Truncated on a character boundary: slicing a multi-byte
+                // sequence in half would panic, and a status line is not worth
+                // a crash in a reader whose whole job is to tolerate whatever
+                // it is handed.
+                let end = value
+                    .char_indices()
+                    .map(|(index, _)| index)
+                    .take_while(|index| *index <= STATUS_PREFIX_BYTES)
+                    .last()
+                    .unwrap_or(0);
+                Ok(StatusPrefix(value[..end].to_owned()))
+            }
+        }
+
+        deserializer.deserialize_str(Visitor)
+    }
+}
+
+impl OutputChunk {
+    /// Whether this status preamble says the tool failed.
+    fn reports_failure(&self) -> bool {
+        self.text
+            .as_ref()
+            .is_some_and(|text| text.0.starts_with("Script failed"))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -532,6 +666,69 @@ mod tests {
 {"timestamp":"2026-08-21T12:00:05Z","type":"event_msg","payload":{"type":"patch_apply_end","success":true,"changes":{"/work/agentwatch/src/main.rs":{"type":"update","unified_diff":"secret source text"}}}}
 {"timestamp":"2026-08-21T12:00:06Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":"not retained"}}
 "#;
+
+    /// A call and the output answering it, six seconds later, reporting failure.
+    const CALL_AND_OUTPUT: &str = r#"
+{"timestamp":"2026-08-21T12:00:00Z","type":"session_meta","payload":{"id":"s-1","cwd":"/work"}}
+{"timestamp":"2026-08-21T12:00:02Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call_x","name":"exec","input":"const r = await tools.exec_command({\"cmd\":\"cargo test\"}); text(r.output);"}}
+{"timestamp":"2026-08-21T12:00:08Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_x","output":[{"type":"input_text","text":"Script failed\nWall time 6.0 seconds\nOutput:\n"},{"type":"input_text","text":"AKIAIOSFODNN7EXAMPLE leaked from the command"}]}}
+"#;
+
+    #[test]
+    fn a_codex_tool_call_is_paired_with_its_output() {
+        // Reliability was Claude-only until this: the same report covering one
+        // agent and silently omitting the other is worse than not having it.
+        let (events, summary) =
+            read_rollout_from(Cursor::new(CALL_AND_OUTPUT), None).expect("read");
+        assert_eq!(summary.tool_outcomes, 1);
+
+        let outcome = events
+            .iter()
+            .find_map(|event| match &event.event {
+                Event::ToolOutcome(outcome) => Some(outcome),
+                _ => None,
+            })
+            .expect("an outcome");
+
+        assert_eq!(outcome.tool, "exec");
+        assert_eq!(outcome.tool_use_id, "call_x");
+        assert_eq!(outcome.duration_ms, Some(6_000));
+        assert!(outcome.failed, "the runner said the script failed");
+    }
+
+    #[test]
+    fn the_output_beside_the_status_line_is_never_retained() {
+        // Codex puts the runner's status and the command's own output in the
+        // same array of strings, so the parser cannot avoid touching the
+        // output — only avoid keeping it. Everything it reads is truncated to
+        // a few dozen bytes on the way in.
+        let (events, _) = read_rollout_from(Cursor::new(CALL_AND_OUTPUT), None).expect("read");
+        let encoded = serde_json::to_string(&events).expect("serializable");
+        assert!(!encoded.contains("AKIA"), "{encoded}");
+        assert!(!encoded.contains("leaked"), "{encoded}");
+    }
+
+    #[test]
+    fn a_status_line_is_truncated_rather_than_kept_whole() {
+        let long = "x".repeat(4_000);
+        let json = format!("\"{long}\"");
+        let prefix: StatusPrefix = serde_json::from_str(&json).expect("parses");
+        assert!(
+            prefix.0.len() <= STATUS_PREFIX_BYTES + 1,
+            "kept {} bytes",
+            prefix.0.len()
+        );
+    }
+
+    #[test]
+    fn an_output_with_no_matching_call_is_ignored() {
+        let text = r#"
+{"timestamp":"2026-08-21T12:00:00Z","type":"session_meta","payload":{"id":"s-1","cwd":"/work"}}
+{"timestamp":"2026-08-21T12:00:08Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"orphan","output":[]}}
+"#;
+        let (_, summary) = read_rollout_from(Cursor::new(text), None).expect("read");
+        assert_eq!(summary.tool_outcomes, 0);
+    }
 
     #[test]
     fn captures_real_metadata_without_content_and_deduplicates_usage() {

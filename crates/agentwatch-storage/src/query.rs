@@ -209,6 +209,45 @@ fn render_value(value: rusqlite::types::ValueRef<'_>) -> Option<String> {
     }
 }
 
+/// Signals that collection itself is degrading.
+///
+/// Distinct from the headline counts, which measure work observed. These
+/// measure work *missed*, or about to be: a collector that has stopped hearing
+/// anything looks identical to an idle machine unless something says otherwise.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Health {
+    /// When the last event was stored, not when it happened.
+    ///
+    /// Storage time is the staleness signal: an event timestamped an hour ago
+    /// and written a second ago means collection is working.
+    pub last_write_us: Option<i64>,
+    /// Sessions whose transcript has never been read to completion.
+    pub unreconciled_sessions: i64,
+}
+
+impl Store {
+    /// Reads the signals that say whether collection is still working.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be queried.
+    pub fn health(&self) -> Result<Health, StoreError> {
+        let health = self.connection().query_row(
+            "SELECT (SELECT MAX(created_at_us) FROM events),
+                    (SELECT COUNT(*) FROM sessions WHERE reconciled_at_us IS NULL)",
+            [],
+            |row| {
+                Ok(Health {
+                    last_write_us: row.get(0)?,
+                    unreconciled_sessions: row.get(1)?,
+                })
+            },
+        )?;
+        Ok(health)
+    }
+}
+
 /// How much one file was rewritten.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileChurn {
@@ -217,6 +256,10 @@ pub struct FileChurn {
     /// Times it was written.
     pub writes: i64,
     /// Times it was read.
+    ///
+    /// Only ever non-zero for an agent with a distinct read tool. Codex has
+    /// none — every read goes through the shell — so its files show zero reads
+    /// here rather than no reads having happened.
     pub reads: i64,
     /// How many distinct sessions touched it.
     pub sessions: i64,
@@ -278,6 +321,13 @@ impl Store {
 /// How one tool has behaved over a range.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolReliability {
+    /// Which agent's tool this is.
+    ///
+    /// Part of the row's identity, not decoration. Agents name their tools
+    /// differently for the same job — Claude's `Bash` and Codex's `exec` both
+    /// run a shell — so a bare tool ranking silently compares two products
+    /// while looking like it compares two tools.
+    pub agent_id: String,
     /// The tool's name, as the agent reported it.
     pub tool: String,
     /// Calls that were matched to a result.
@@ -334,7 +384,7 @@ impl Store {
         to_us: i64,
     ) -> Result<Vec<ToolReliability>, StoreError> {
         let mut statement = self.connection().prepare(
-            "SELECT tool, duration_ms, failed
+            "SELECT agent_id, tool, duration_ms, failed
                FROM tool_outcomes
               WHERE timestamp_us >= ?1 AND timestamp_us < ?2",
         )?;
@@ -342,16 +392,19 @@ impl Store {
         let rows = statement.query_map([from_us, to_us], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, Option<i64>>(1)?,
-                row.get::<_, i64>(2)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, i64>(3)?,
             ))
         })?;
 
-        let mut collected: std::collections::HashMap<String, (i64, i64, Vec<i64>)> =
+        let mut collected: std::collections::HashMap<(String, String), (i64, i64, Vec<i64>)> =
             std::collections::HashMap::new();
         for row in rows {
-            let (tool, duration, failed) = row?;
-            let entry = collected.entry(tool).or_insert((0, 0, Vec::new()));
+            let (agent_id, tool, duration, failed) = row?;
+            let entry = collected
+                .entry((agent_id, tool))
+                .or_insert((0, 0, Vec::new()));
             entry.0 += 1;
             entry.1 += i64::from(failed != 0);
             if let Some(duration) = duration {
@@ -361,9 +414,10 @@ impl Store {
 
         let mut report: Vec<ToolReliability> = collected
             .into_iter()
-            .map(|(tool, (calls, failures, mut durations))| {
+            .map(|((agent_id, tool), (calls, failures, mut durations))| {
                 durations.sort_unstable();
                 ToolReliability {
+                    agent_id,
                     tool,
                     calls,
                     failures,
@@ -374,7 +428,12 @@ impl Store {
             })
             .collect();
 
-        report.sort_by(|a, b| b.calls.cmp(&a.calls).then_with(|| a.tool.cmp(&b.tool)));
+        report.sort_by(|a, b| {
+            b.calls
+                .cmp(&a.calls)
+                .then_with(|| a.agent_id.cmp(&b.agent_id))
+                .then_with(|| a.tool.cmp(&b.tool))
+        });
         Ok(report)
     }
 }

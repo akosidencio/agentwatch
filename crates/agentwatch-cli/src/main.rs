@@ -603,49 +603,106 @@ fn status(paths: &Paths) -> Result<()> {
     counter("active sessions", totals.active_sessions);
     counter("projects", totals.projects);
 
-    print_unknown_events(&store, totals.unknown_events)?;
+    print_collection_health(&store, totals.unknown_events)?;
 
     Ok(())
 }
 
-/// Warns when the adapter has stopped understanding what it is being sent.
+/// Counts how many of our hook events are actually registered.
 ///
-/// Silent only when there is nothing to say. Every other counter in `status` is
-/// a measure of work observed; this one is a measure of work *missed*, and it
-/// is the difference between a monitor that is healthy and one that merely
-/// looks it — an unrecognised payload is still recorded, still counted in
-/// `events`, and still missing the file path or command line it arrived with.
-fn print_unknown_events(store: &Store, unknown: i64) -> Result<()> {
-    if unknown == 0 {
+/// # Why this is read from the settings file and not from our own records
+///
+/// The database can only say what arrived. It cannot say what was supposed to
+/// arrive and did not, and a hook that was never registered produces exactly
+/// the same silence as an agent that was never run. Reading the file the agent
+/// actually consults is the only way to tell those apart — and the failure is
+/// real: a release that added four hook events shipped with an installer that
+/// still wrote four, so half of them were silently absent and every surface
+/// reported healthy.
+fn registered_hook_events(settings: &std::path::Path) -> Option<(usize, usize)> {
+    let value = install::file::read(settings).ok()?;
+    let hooks = value.get("hooks")?.as_object()?;
+
+    let registered = install::HOOK_EVENTS
+        .iter()
+        .filter(|event| {
+            hooks
+                .get(**event)
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|groups| {
+                    groups
+                        .iter()
+                        .filter_map(|group| group.get("hooks"))
+                        .filter_map(serde_json::Value::as_array)
+                        .flatten()
+                        .filter_map(|entry| entry.get("command"))
+                        .filter_map(serde_json::Value::as_str)
+                        .any(agentwatch_types::is_our_hook_command)
+                })
+        })
+        .count();
+
+    Some((registered, install::HOOK_EVENTS.len()))
+}
+
+/// Reports whether collection is still working, and says so only when it is not.
+///
+/// Every line here is silent in the healthy case. A status screen that always
+/// prints a wall of green teaches people to stop reading it, and the whole
+/// value of these checks is being noticed the one time they fire.
+fn print_collection_health(store: &Store, unknown: i64) -> Result<()> {
+    let mut warnings: Vec<String> = Vec::new();
+
+    let settings = install::file::default_settings_path();
+    match registered_hook_events(&settings) {
+        Some((registered, expected)) if registered < expected => warnings.push(format!(
+            "⚠ {registered} of {expected} hook events registered — run `agentwatch init` to add the rest"
+        )),
+        None => warnings.push(format!(
+            "⚠ no hooks registered in {} — run `agentwatch init`",
+            settings.display()
+        )),
+        Some(_) => {}
+    }
+
+    let health = store.health().context("reading collection health")?;
+    if let Some(last) = health.last_write_us {
+        let idle_hours = (Timestamp::now().as_micros() - last) / 3_600_000_000;
+        if idle_hours >= 24 {
+            warnings.push(format!(
+                "⚠ nothing collected for {idle_hours} hours — the collector may not be running"
+            ));
+        }
+    }
+
+    if unknown > 0 {
+        let labels = store
+            .unknown_event_labels(4)
+            .context("reading unrecognised event labels")?;
+        let named = labels
+            .iter()
+            .map(|(label, count)| format!("{label} ({count})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        warnings.push(format!("⚠ {unknown} events not understood — {named}"));
+        warnings.push(
+            "  Their detail was dropped at collection. Upgrade, or report these names.".to_owned(),
+        );
+    }
+
+    if warnings.is_empty() {
         return Ok(());
     }
 
-    let labels = store
-        .unknown_event_labels(4)
-        .context("reading unrecognised event labels")?;
-    let named = labels
-        .iter()
-        .map(|(label, count)| format!("{label} ({count})"))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    // The glyph and the wording carry the state on their own, so the warning
-    // still reads as a warning with colour stripped or piped away.
     println!();
-    println!(
-        "{}",
-        theme::paint(
-            &format!("⚠ {unknown} events not understood — {named}"),
-            theme::WARN
-        )
-    );
-    println!(
-        "{}",
-        theme::paint(
-            "  Their detail was dropped at collection. Upgrade, or report these names.",
+    for warning in warnings {
+        let colour = if warning.starts_with('#') || warning.starts_with("  ") {
             theme::MUTED
-        )
-    );
+        } else {
+            theme::WARN
+        };
+        println!("{}", theme::paint(&warning, colour));
+    }
 
     Ok(())
 }
@@ -771,6 +828,15 @@ fn churn(paths: &Paths, days: u32, all: bool, limit: usize) -> Result<()> {
         )
     );
 
+    // Said once, because a zero in the reads column otherwise reads as "the
+    // agent never looked at this file" when it may only mean the agent has no
+    // read tool to report.
+    let mixed_agents = store
+        .query("SELECT COUNT(DISTINCT agent_id) FROM file_events WHERE operation = 'read'")
+        .ok()
+        .and_then(|result| result.rows.first()?.first()?.clone())
+        .is_some_and(|distinct| distinct == "1");
+
     for file in &churn {
         println!(
             "{:>7}{:>8}{:>10}  {}",
@@ -778,6 +844,18 @@ fn churn(paths: &Paths, days: u32, all: bool, limit: usize) -> Result<()> {
             file.reads,
             file.sessions,
             render::short_path(&file.path, std::env::var("HOME").ok().as_deref()),
+        );
+    }
+
+    if mixed_agents {
+        println!();
+        println!(
+            "{}",
+            theme::paint(
+                "Reads are only reported by agents with a read tool. Codex reads through the \
+                 shell, so its files show none.",
+                theme::MUTED
+            )
         );
     }
 
@@ -896,8 +974,8 @@ fn reliability(paths: &Paths, days: u32, all: bool, limit: usize) -> Result<()> 
         "{}",
         theme::paint(
             &format!(
-                "{:<16}{:>8}{:>9}{:>10}{:>10}{:>10}",
-                "tool", "calls", "failed", "p50", "p95", "max"
+                "{:<13}{:<16}{:>8}{:>9}{:>10}{:>10}{:>10}",
+                "agent", "tool", "calls", "failed", "p50", "p95", "max"
             ),
             theme::MUTED
         )
@@ -922,7 +1000,8 @@ fn reliability(paths: &Paths, days: u32, all: bool, limit: usize) -> Result<()> 
         };
 
         println!(
-            "{:<16}{:>8}{}{:>10}{:>10}{:>10}",
+            "{:<13}{:<16}{:>8}{}{:>10}{:>10}{:>10}",
+            tool.agent_id,
             tool.tool,
             render::thousands(tool.calls),
             failed,
@@ -2089,5 +2168,58 @@ mod session_receipt_tests {
         );
         assert!(timeline.iter().any(|event| event.kind == "file.write"));
         assert!(timeline.len() >= events.len());
+    }
+
+    #[test]
+    fn a_partly_registered_settings_file_is_reported_as_partial() {
+        // The exact state a version bump produced once: `HOOK_EVENTS` grew, the
+        // installer kept writing the old set, and every surface reported
+        // healthy while half the hooks were absent. The database cannot see
+        // this — a hook that was never registered is indistinguishable from an
+        // agent that was never run — so the check reads the settings file.
+        let directory = tempfile::tempdir().expect("temp dir");
+        let settings = directory.path().join("settings.json");
+        let command = "/opt/bin/agentwatch hook";
+
+        let partial: serde_json::Map<String, serde_json::Value> = install::HOOK_EVENTS
+            .iter()
+            .take(2)
+            .map(|event| {
+                (
+                    (*event).to_owned(),
+                    serde_json::json!([{ "hooks": [{ "type": "command", "command": command }] }]),
+                )
+            })
+            .collect();
+        std::fs::write(
+            &settings,
+            serde_json::json!({ "hooks": partial }).to_string(),
+        )
+        .expect("write");
+
+        assert_eq!(
+            registered_hook_events(&settings),
+            Some((2, install::HOOK_EVENTS.len()))
+        );
+    }
+
+    #[test]
+    fn a_file_with_no_hooks_of_ours_is_reported_as_none() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let settings = directory.path().join("settings.json");
+        // Another tool's hook must not be counted as ours.
+        std::fs::write(
+            &settings,
+            serde_json::json!({
+                "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": "/other/tool" }] }] }
+            })
+            .to_string(),
+        )
+        .expect("write");
+
+        assert_eq!(
+            registered_hook_events(&settings),
+            Some((0, install::HOOK_EVENTS.len()))
+        );
     }
 }

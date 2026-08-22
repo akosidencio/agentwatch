@@ -18,7 +18,7 @@ mod store;
 mod tokens;
 
 pub use config_watch::ConfigCheck;
-pub use query::{EventRow, FileChurn, QueryResult, ToolReliability, Totals};
+pub use query::{EventRow, FileChurn, Health, QueryResult, ToolReliability, Totals};
 pub use receipt::{ReceiptCommand, ReceiptFile, ReceiptTokenGroup};
 pub use redaction::ScrubReport;
 pub use repositories::BackfillReport;
